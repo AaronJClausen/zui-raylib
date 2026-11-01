@@ -66,7 +66,7 @@ const Preferences = struct {
     font_size: u8 = 20,
     show_tooltips: bool = true,
     autosave: Autosave = .{},
-    build: []const u8 = "zui 0.4.0, zui-raylib 0.2.0",
+    build: []const u8 = "zui 0.5.0, zui-raylib 0.3.0",
     times_saved: u32 = 0,
 
     pub const zui_inspector: zui_reflect.Options(@This()) = .{ .fields = .{

@@ -1,6 +1,6 @@
 .{
     .name = .zui_raylib,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0x2d268c9b2a1553, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -9,8 +9,8 @@
             .hash = "raylib-6.0.0-whq8uCSwLgWWeF3ec3dbG6Rr36SLFL-s2WJ1Q_2E22Bb",
         },
         .zui = .{
-            .url = "git+https://github.com/AaronJClausen/zui#1bbc00e85f138003303e73127c1624761b46344e",
-            .hash = "zui-0.4.0-xfvfqrqlBQDt9gopg9nm3qWYTaVj7HQVeKmNCkd3aD-w",
+            .url = "git+https://github.com/AaronJClausen/zui#3523e0d82ddbc668103e22720923a2408875e87b",
+            .hash = "zui-0.5.0-xfvfqr2GBgDQ1f7WFZ8fRxu9ApWTFDjU2tELW2zuCWAm",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "examples", "README.md", "LICENSE" },
