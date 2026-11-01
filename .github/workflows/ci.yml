@@ -57,6 +57,9 @@ jobs:
         run: |
           xvfb-run --auto-servernum zig build demo -- --screenshot "$PWD/demo.png"
           xvfb-run --auto-servernum zig build demo -- --screenshot "$PWD/demo-about.png" --about
+          xvfb-run --auto-servernum zig build demo -- --screenshot "$PWD/demo-thumbnails.png" --thumbnails 2>&1 | tee thumbnails.log
+      - name: Check that scrolling canceled pending thumbnail loads
+        run: grep -E "thumbnail loads: started [0-9]+, completed [0-9]+, canceled [1-9][0-9]*" thumbnails.log
       - name: Keep the renders
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

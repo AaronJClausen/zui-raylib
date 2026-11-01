@@ -1,17 +1,20 @@
 //! The zui reference application.
 //!
 //! ```sh
-//! zig build demo                                   # interactive window
-//! zig build demo -- --screenshot demo.png          # render offscreen and save a PNG
-//! zig build demo -- --screenshot demo.png --about  # ...with the About dialog open
+//! zig build demo                                        # interactive window
+//! zig build demo -- --screenshot demo.png               # render offscreen and save a PNG
+//! zig build demo -- --screenshot demo.png --about       # ...with the About dialog open
+//! zig build demo -- --screenshot grid.png --thumbnails  # ...in the thumbnail grid
+//! zig build demo -- --hidden                            # run interactively in a hidden window
 //! ```
 
 const std = @import("std");
+const Io = std.Io;
 const zui_raylib = @import("zui_raylib");
 const zui = zui_raylib.zui;
 const c = zui_raylib.c;
 
-const Ui = zui.Context(zui_raylib.config(.{ .max_elements = 1024 }), zui_raylib.Platform);
+const Ui = zui.Context(zui_raylib.config(.{ .max_elements = 4096 }), zui_raylib.Platform);
 
 const Theme = struct {
     background: zui.Color = .rgb(0x16161c),
@@ -34,16 +37,29 @@ const Theme = struct {
 
 const theme: Theme = .{};
 
+/// A thumbnail as a 4×4 grid of colors, produced by a background task.
+const Thumbnail = struct { colors: [4][4]zui.Color };
+
+const thumbnail_count = 600;
+const thumbnail_columns = 7;
+const thumbnail_size = 120;
+const thumbnail_gap = 12;
+const thumbnail_pitch = thumbnail_size + thumbnail_gap;
+const thumbnail_rows = (thumbnail_count + thumbnail_columns - 1) / thumbnail_columns;
+
 const App = struct {
+    io: Io,
+    view: enum { documents, thumbnails } = .documents,
     clicks: u32 = 0,
     last_action: []const u8 = "nothing yet",
     selected_item: ?usize = 2,
     about_open: bool = false,
+    thumbnails: zui.TaskPool(Io.Cancelable!Thumbnail, 96) = .init,
 };
 
 const DetailsState = struct { open: bool };
 
-const ids = zui.ids(.{ "toolbar", "new", "open", "save", "about", "sidebar", "content", "details_toggle", "hover_me", "dialog_close" });
+const ids = zui.ids(.{ "toolbar", "new", "open", "save", "documents_view", "thumbnails_view", "about", "sidebar", "content", "details_toggle", "hover_me", "dialog_close", "grid" });
 
 fn label(ui: *Ui, content: []const u8, size: f32, color: zui.Color) void {
     ui.text(content, .{ .size = size, .color = color });
@@ -81,6 +97,8 @@ fn toolbar(ui: *Ui, app: *App) void {
         }
     }
     ui.box(.{ .layout = .{ .sizing = .{ .width = .grow } } });
+    if (button(ui, ids.documents_view, "Documents")) app.view = .documents;
+    if (button(ui, ids.thumbnails_view, "Thumbnails")) app.view = .thumbnails;
     if (button(ui, ids.about, "About")) app.about_open = true;
 }
 
@@ -164,6 +182,77 @@ fn mainPanel(ui: *Ui, app: *App) void {
     label(ui, status, 20, theme.muted_text);
 }
 
+/// The background task: a slow "load" (200–800 ms of cancelable sleep)
+/// followed by colors derived from the index.
+fn loadThumbnail(io: Io, index: usize) Io.Cancelable!Thumbnail {
+    var prng: std.Random.DefaultPrng = .init(index *% 0x9E3779B97F4A7C15);
+    const random = prng.random();
+    try io.sleep(.fromMilliseconds(random.intRangeAtMost(i64, 200, 800)), .awake);
+    var thumbnail: Thumbnail = undefined;
+    const base_hue = random.int(u8);
+    for (&thumbnail.colors, 0..) |*row, row_index| for (row, 0..) |*color, column_index| {
+        const shade: u8 = @intCast(40 + (row_index + column_index) * 20);
+        color.* = .{ .r = base_hue, .g = shade, .b = 255 - base_hue / 2 };
+    };
+    return thumbnail;
+}
+
+/// Only the rows near the visible part of the grid are declared. Rows that
+/// scroll away stop being declared, so zui cancels their pending loads.
+fn thumbnailGrid(ui: *Ui, app: *App) void {
+    ui.open(.{ .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both, .padding = .all(16), .child_gap = 12 } });
+    defer ui.close();
+
+    const offset = ui.scrollOffset(ids.grid)[1];
+    const visible_height = if (ui.rectOf(ids.grid)) |rect| rect.height else 600;
+    const first_row: usize = @intFromFloat(@max(0, @floor(offset / thumbnail_pitch) - 1));
+    const last_row: usize = @min(thumbnail_rows - 1, @as(usize, @intFromFloat(@floor((offset + visible_height) / thumbnail_pitch))) + 1);
+
+    var stats_buffer: [160]u8 = undefined;
+    const stats = app.thumbnails.stats;
+    const summary = std.fmt.bufPrint(&stats_buffer, "{d} thumbnails, rows {d}-{d} declared.  Loads started {d}, completed {d}, canceled {d}", .{
+        thumbnail_count, first_row + 1, last_row + 1, stats.started, stats.completed, stats.canceled,
+    }) catch "";
+    label(ui, summary, 20, theme.muted_text);
+
+    ui.open(.{ .id = ids.grid, .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both, .child_gap = thumbnail_gap }, .scroll = .{} });
+    defer ui.close();
+
+    if (first_row > 0) ui.box(.{ .layout = .{ .sizing = .{ .height = .fixed(@as(f32, @floatFromInt(first_row)) * thumbnail_pitch - thumbnail_gap) } } });
+    for (first_row..last_row + 1) |row| {
+        ui.open(.{ .layout = .{ .child_gap = thumbnail_gap } });
+        defer ui.close();
+        for (0..thumbnail_columns) |column| {
+            const index = row * thumbnail_columns + column;
+            if (index >= thumbnail_count) break;
+            thumbnailCell(ui, app, index);
+        }
+    }
+    const rows_below = thumbnail_rows - 1 - last_row;
+    if (rows_below > 0) ui.box(.{ .layout = .{ .sizing = .{ .height = .fixed(@as(f32, @floatFromInt(rows_below)) * thumbnail_pitch - thumbnail_gap) } } });
+}
+
+fn thumbnailCell(ui: *Ui, app: *App, index: usize) void {
+    const id: zui.Id = .indexed("thumbnail", index);
+    ui.open(.{
+        .id = id,
+        .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .fixed(thumbnail_size), .height = .fixed(thumbnail_size) }, .padding = .all(8), .child_alignment = .{ .x = .center, .y = .center } },
+        .background = theme.panel,
+        .corner_radius = .all(6),
+    });
+    defer ui.close();
+
+    switch (app.thumbnails.request(ui, id, loadThumbnail, .{ app.io, index }, .{})) {
+        .pending => label(ui, "loading", 20, theme.muted_text),
+        .failed => label(ui, "canceled", 20, theme.muted_text),
+        .ready => |thumbnail| for (thumbnail.colors) |row| {
+            ui.open(.{ .layout = .{ .sizing = .{ .width = .grow, .height = .grow } } });
+            defer ui.close();
+            for (row) |color| ui.box(.{ .layout = .{ .sizing = .grow_both }, .background = color });
+        },
+    }
+}
+
 fn aboutDialog(ui: *Ui, app: *App) void {
     if (!app.about_open) return;
     if (ui.keyPressed(.escape)) app.about_open = false;
@@ -192,16 +281,23 @@ fn declare(ui: *Ui, app: *App) void {
     ui.open(.{ .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both }, .background = theme.background });
     defer ui.close();
     toolbar(ui, app);
-    ui.open(.{ .layout = .{ .sizing = .grow_both } });
-    sidebar(ui, app);
-    mainPanel(ui, app);
-    ui.close();
+    switch (app.view) {
+        .documents => {
+            ui.open(.{ .layout = .{ .sizing = .grow_both } });
+            sidebar(ui, app);
+            mainPanel(ui, app);
+            ui.close();
+        },
+        .thumbnails => thumbnailGrid(ui, app),
+    }
     aboutDialog(ui, app);
 }
 
 const Options = struct {
     screenshot_path: ?[:0]const u8 = null,
     about_open: bool = false,
+    thumbnails: bool = false,
+    hidden: bool = false,
 };
 
 fn parseOptions(arguments: []const [:0]const u8) !Options {
@@ -215,8 +311,12 @@ fn parseOptions(arguments: []const [:0]const u8) !Options {
             options.screenshot_path = arguments[index];
         } else if (std.mem.eql(u8, argument, "--about")) {
             options.about_open = true;
+        } else if (std.mem.eql(u8, argument, "--thumbnails")) {
+            options.thumbnails = true;
+        } else if (std.mem.eql(u8, argument, "--hidden")) {
+            options.hidden = true;
         } else {
-            std.debug.print("unknown argument \"{s}\"; expected --screenshot <path> and/or --about\n", .{argument});
+            std.debug.print("unknown argument \"{s}\"; expected --screenshot <path>, --about, --thumbnails or --hidden\n", .{argument});
             return error.UnknownArgument;
         }
     }
@@ -227,17 +327,17 @@ pub fn main(init: std.process.Init) !void {
     const options = try parseOptions(try init.minimal.args.toSlice(init.arena.allocator()));
     const screenshot_mode = options.screenshot_path != null;
 
-    c.SetConfigFlags(if (screenshot_mode) c.FLAG_WINDOW_HIDDEN else c.FLAG_WINDOW_RESIZABLE | c.FLAG_MSAA_4X_HINT);
+    c.SetConfigFlags(if (screenshot_mode or options.hidden) c.FLAG_WINDOW_HIDDEN else c.FLAG_WINDOW_RESIZABLE | c.FLAG_MSAA_4X_HINT);
     c.InitWindow(1100, 700, "zui + raylib");
     defer c.CloseWindow();
     c.SetTargetFPS(60);
-    if (!screenshot_mode) c.EnableEventWaiting();
 
     var platform: zui_raylib.Platform = .{};
     var ui = try Ui.init(init.gpa, init.io, &platform);
     defer ui.deinit(init.gpa);
 
-    var app: App = .{ .about_open = options.about_open };
+    var app: App = .{ .io = init.io, .about_open = options.about_open, .view = if (options.thumbnails) .thumbnails else .documents };
+    defer app.thumbnails.deinit(&ui);
     const offscreen = if (screenshot_mode) c.LoadRenderTexture(c.GetScreenWidth(), c.GetScreenHeight()) else undefined;
     defer if (screenshot_mode) c.UnloadRenderTexture(offscreen);
 
@@ -246,10 +346,18 @@ pub fn main(init: std.process.Init) !void {
         var reader: zui_raylib.InputReader = .{};
         var input = reader.read(.{});
         if (screenshot_mode) {
-            // Rest the pointer on "Hover me" (known from the previous frame)
-            // so the screenshot shows hover state and the tooltip.
-            input.pointer = if (ui.rectOf(ids.hover_me)) |rect| .{ rect.x + rect.width / 2, rect.y + rect.height / 2 } else null;
             input.buttons = .initEmpty();
+            switch (app.view) {
+                // Rest the pointer on "Hover me" (known from the previous frame)
+                // so the screenshot shows hover state and the tooltip.
+                .documents => input.pointer = if (ui.rectOf(ids.hover_me)) |rect| centerOf(rect) else null,
+                // Scroll far down once loads are underway, so the rows that
+                // leave the screen have their pending loads canceled.
+                .thumbnails => {
+                    input.pointer = if (ui.rectOf(ids.grid)) |rect| centerOf(rect) else null;
+                    if (frame_number == 5) input.wheel = .{ 0, 3000 };
+                },
+            }
         }
 
         ui.beginFrame(input);
@@ -260,16 +368,38 @@ pub fn main(init: std.process.Init) !void {
         if (screenshot_mode) c.BeginTextureMode(offscreen) else c.BeginDrawing();
         c.ClearBackground(.{ .r = theme.background.r, .g = theme.background.g, .b = theme.background.b, .a = 255 });
         zui_raylib.render(Ui.RenderCommand, &platform, frame.commands(), .{});
-        if (screenshot_mode) c.EndTextureMode() else c.EndDrawing();
+        if (screenshot_mode) {
+            c.EndTextureMode();
+        } else {
+            // Sleep in EndDrawing until input or a task's wake, unless the
+            // frame just drawn may already be out of date.
+            if (ui.needsFrame()) c.DisableEventWaiting() else c.EnableEventWaiting();
+            c.EndDrawing();
+        }
 
-        // Three frames: the first lays out, the second hovers, the third shows the tooltip.
-        if (screenshot_mode and frame_number == 2) {
+        if (screenshot_mode and screenshotReady(&app, frame_number)) {
             var image = c.LoadImageFromTexture(offscreen.texture);
             defer c.UnloadImage(image);
             c.ImageFlipVertical(&image);
             if (!c.ExportImage(image, options.screenshot_path.?.ptr)) return error.ScreenshotFailed;
             std.debug.print("saved {s}\n", .{options.screenshot_path.?});
+            const stats = app.thumbnails.stats;
+            if (app.view == .thumbnails) std.debug.print("thumbnail loads: started {d}, completed {d}, canceled {d}\n", .{ stats.started, stats.completed, stats.canceled });
             break;
         }
+        if (screenshot_mode and app.view == .thumbnails) init.io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
+}
+
+fn centerOf(rect: zui.Rect) [2]f32 {
+    return .{ rect.x + rect.width / 2, rect.y + rect.height / 2 };
+}
+
+/// Documents: three frames (lay out, hover, show the tooltip). Thumbnails:
+/// once some loads have finished and others are still pending.
+fn screenshotReady(app: *const App, frame_number: u32) bool {
+    return switch (app.view) {
+        .documents => frame_number == 2,
+        .thumbnails => app.thumbnails.stats.completed >= 20 or frame_number > 600,
+    };
 }

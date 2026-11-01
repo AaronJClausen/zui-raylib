@@ -9,8 +9,8 @@
             .hash = "raylib-6.0.0-whq8uCSwLgWWeF3ec3dbG6Rr36SLFL-s2WJ1Q_2E22Bb",
         },
         .zui = .{
-            .url = "git+https://github.com/AaronJClausen/zui#d40a1708e251d0e4d9e94e324e7e493c44533756",
-            .hash = "zui-0.2.0-xfvfqvSdAwBOylPKxlqyZzFcdIgBkE6pNW2pQMlbnEau",
+            .url = "git+https://github.com/AaronJClausen/zui#02673e302e8ce8ea92a49170d9365c529cc3ca0b",
+            .hash = "zui-0.3.0-xfvfqowTBADv5SsD3ZzzaQxHykXlxJRvNjBTfB2UfkIy",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "examples", "README.md", "LICENSE" },

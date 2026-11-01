@@ -12,6 +12,10 @@ pub const c = @import("raylib");
 
 pub const Texture = c.Texture2D;
 
+/// Compiled into raylib with its desktop GLFW platform (the default);
+/// raylib itself exposes no way to wake its event wait from another thread.
+extern fn glfwPostEmptyEvent() void;
+
 /// A `zui.Config` with raylib textures as image payloads; override any
 /// field: `zui.Context(zui_raylib.config(.{ .max_elements = 8192 }), zui_raylib.Platform)`.
 pub fn config(overrides: zui.Config) zui.Config {
@@ -50,6 +54,14 @@ pub const Platform = struct {
     /// zui snaps command bounds to whole pixels when this is declared.
     pub fn scale(_: *const Platform) f32 {
         return 1;
+    }
+
+    /// Called by zui from task threads when a task completes. Ends raylib's
+    /// event wait (`EnableEventWaiting`) so the result is drawn without
+    /// waiting for input. GLFW documents this function as callable from any
+    /// thread.
+    pub fn wake(_: *Platform) void {
+        glfwPostEmptyEvent();
     }
 
     pub fn fontFor(self: *const Platform, font: u16) c.Font {

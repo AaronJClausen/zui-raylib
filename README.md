@@ -21,15 +21,22 @@ commands. It also contains zui's reference application.
 zig build demo
 zig build demo -- --screenshot demo.png           # render offscreen and save a PNG
 zig build demo -- --screenshot demo.png --about   # ...with the About dialog open
+zig build demo -- --screenshot grid.png --thumbnails  # ...in the thumbnail grid
 ```
 
-The demo shows every zui 0.2 feature:
+The demo shows every zui feature through 0.3:
 - toolbar buttons with hover, press and focus states;
 - a scrollable, selectable list (scroll with the wheel);
 - wrapped text that re-wraps as the window resizes;
 - a toggle whose state lives in zui's state table;
 - a floating tooltip;
-- an About dialog that keeps Tab focus inside it.
+- an About dialog that keeps Tab focus inside it;
+- a **Thumbnails** view: a grid of 600 cells where each thumbnail loads in
+  a zui `TaskPool` (200–800 ms of simulated I/O). Only the rows near the
+  visible area are declared, so scrolling away cancels their pending
+  loads. The header counts loads started, completed and canceled.
+
+![The thumbnail grid after a fast scroll](docs/thumbnails.png)
 
 Press Tab and Shift-Tab to move focus, and Enter or Space to activate.
 
@@ -63,6 +70,9 @@ while (!c.WindowShouldClose()) {
     c.BeginDrawing();
     c.ClearBackground(.{ .r = 22, .g = 22, .b = 28, .a = 255 });
     zui_raylib.render(Ui.RenderCommand, &platform, frame.commands(), .{});
+    // Sleep in EndDrawing until input or a task wakes us, unless the frame
+    // just drawn may already be out of date.
+    if (ui.needsFrame()) c.DisableEventWaiting() else c.EnableEventWaiting();
     c.EndDrawing();
     ui.release(frame);
 }
@@ -71,8 +81,12 @@ while (!c.WindowShouldClose()) {
 `zui_raylib.config(...)` sets `ImageHandle` to raylib's `Texture2D`, so
 `ui.image(texture, ...)` draws directly. Other payload types can be
 drawn with the `draw_image` and `draw_custom` hooks in `RenderOptions`.
-For an application that only redraws on input, call
-`c.EnableEventWaiting()`, as the demo does.
+With that loop, an idle application uses no CPU. `Platform.wake` ends
+raylib's event wait when a background task completes, using
+`glfwPostEmptyEvent` (compiled into raylib's default desktop GLFW
+platform). Measured with the demo in a hidden window: 0.0 ms of CPU over
+10 idle seconds in both views. The same build with event waiting
+disabled used 1,515.6 ms over those 10 seconds.
 
 ## What the backend maps, and how
 
