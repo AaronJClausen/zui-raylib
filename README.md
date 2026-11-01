@@ -1,0 +1,100 @@
+# zui-raylib
+
+A [raylib](https://www.raylib.com) backend for
+[zui](https://github.com/AaronJClausen/zui): it reads raylib input into
+`zui.Input`, measures text with raylib fonts, and draws zui's render
+commands. It also contains zui's reference application.
+
+![The demo application](docs/demo.png)
+
+## Requirements
+
+- Zig **0.16.0**
+- raylib **6.0**, fetched automatically. It is the newest raylib release
+  whose build supports Zig 0.16.
+- On Linux, raylib's X11 and OpenGL development packages:
+  `libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev`
+
+## Run the demo
+
+```sh
+zig build demo
+zig build demo -- --screenshot demo.png           # render offscreen and save a PNG
+zig build demo -- --screenshot demo.png --about   # ...with the About dialog open
+```
+
+The demo shows every zui 0.2 feature:
+- toolbar buttons with hover, press and focus states;
+- a scrollable, selectable list (scroll with the wheel);
+- wrapped text that re-wraps as the window resizes;
+- a toggle whose state lives in zui's state table;
+- a floating tooltip;
+- an About dialog that keeps Tab focus inside it.
+
+Press Tab and Shift-Tab to move focus, and Enter or Space to activate.
+
+## Use it in your application
+
+```sh
+zig fetch --save git+https://github.com/AaronJClausen/zui-raylib
+```
+
+```zig
+// build.zig
+const backend = b.dependency("zui_raylib", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("zui_raylib", backend.module("zui_raylib"));
+```
+
+```zig
+const zui_raylib = @import("zui_raylib");
+const zui = zui_raylib.zui; // the same zui the backend was built with
+const c = zui_raylib.c;
+
+const Ui = zui.Context(zui_raylib.config(.{}), zui_raylib.Platform);
+
+var platform: zui_raylib.Platform = .{}; // or .{ .fonts = &my_fonts }
+var ui = try Ui.init(gpa, io, &platform);
+
+while (!c.WindowShouldClose()) {
+    var reader: zui_raylib.InputReader = .{};
+    ui.beginFrame(reader.read(.{}));
+    // ... declare your UI ...
+    const frame = ui.endFrame() catch ui.lastFrame();
+    c.BeginDrawing();
+    c.ClearBackground(.{ .r = 22, .g = 22, .b = 28, .a = 255 });
+    zui_raylib.render(Ui.RenderCommand, &platform, frame.commands(), .{});
+    c.EndDrawing();
+    ui.release(frame);
+}
+```
+
+`zui_raylib.config(...)` sets `ImageHandle` to raylib's `Texture2D`, so
+`ui.image(texture, ...)` draws directly. Other payload types can be
+drawn with the `draw_image` and `draw_custom` hooks in `RenderOptions`.
+For an application that only redraws on input, call
+`c.EnableEventWaiting()`, as the demo does.
+
+## What the backend maps, and how
+
+| zui | raylib |
+|---|---|
+| `rectangle` | `DrawRectangleRec`, or `DrawRectangleRounded` with a corner radius |
+| `border` | four bands inside the bounds; `DrawRectangleRoundedLinesEx` when uniform and rounded |
+| `text` | `DrawTextEx`, one call per wrapped line |
+| `image` | `DrawTexturePro` |
+| `clip_begin` / `clip_end` | `BeginScissorMode` / `EndScissorMode` with a stack |
+| wheel | `GetMouseWheelMoveV`, flipped and scaled by `InputOptions.wheel_step` |
+
+Two raylib limits are worth knowing:
+- **Corner radii.** raylib rounds all four corners the same, so the
+  largest of zui's four radii is used.
+- **Letter spacing.** Text is measured glyph by glyph with the spacing
+  after each glyph included. zui measures words and spaces separately and
+  adds them up, so measurement has to be additive. raylib's own
+  `MeasureTextEx` leaves out the spacing after the last glyph, which
+  under-measures every word and made text overflow its box in early
+  testing.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
