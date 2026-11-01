@@ -5,6 +5,7 @@
 //! zig build demo -- --screenshot demo.png               # render offscreen and save a PNG
 //! zig build demo -- --screenshot demo.png --about       # ...with the About dialog open
 //! zig build demo -- --screenshot grid.png --thumbnails  # ...in the thumbnail grid
+//! zig build demo -- --screenshot settings.png --settings # ...in the generated settings editor
 //! zig build demo -- --hidden                            # run interactively in a hidden window
 //! ```
 
@@ -12,6 +13,8 @@ const std = @import("std");
 const Io = std.Io;
 const zui_raylib = @import("zui_raylib");
 const zui = zui_raylib.zui;
+const zui_widgets = zui_raylib.zui_widgets;
+const zui_reflect = zui_raylib.zui_reflect;
 const c = zui_raylib.c;
 
 const Ui = zui.Context(zui_raylib.config(.{ .max_elements = 4096 }), zui_raylib.Platform);
@@ -37,6 +40,52 @@ const Theme = struct {
 
 const theme: Theme = .{};
 
+const widgets: zui_widgets.Widgets(Ui) = .{ .theme = .{
+    .text = .{ .size = 20, .color = theme.text },
+    .muted_text_color = theme.muted_text,
+    .control = theme.button,
+    .border_color = theme.border,
+    .accent = theme.accent,
+    .track = theme.border,
+    .focus_ring = theme.focus_ring,
+    .popup_background = theme.panel,
+    .corner_radius = 6,
+    .control_height = 38,
+    .horizontal_padding = 14,
+    .checkbox_size = 22,
+    .slider_thumb_size = .{ 14, 24 },
+    .label_width = 200,
+} };
+
+/// Everything in the Settings view is generated from this struct by
+/// `zui_reflect.inspector`.
+const Preferences = struct {
+    display_name: zui_widgets.EditableText,
+    color_scheme: enum { midnight, dusk, high_contrast } = .midnight,
+    interface_scale: f32 = 1,
+    font_size: u8 = 20,
+    show_tooltips: bool = true,
+    autosave: Autosave = .{},
+    build: []const u8 = "zui 0.4.0, zui-raylib 0.2.0",
+    times_saved: u32 = 0,
+
+    pub const zui_inspector: zui_reflect.Options(@This()) = .{ .fields = .{
+        .display_name = .{ .placeholder = "Your name" },
+        .interface_scale = .{ .min = 0.75, .max = 2, .step = 0.05 },
+        .font_size = .{ .min = 12, .step = 2 },
+        .times_saved = .{ .hidden = true },
+    } };
+};
+
+const Autosave = struct {
+    enabled: bool = true,
+    interval_minutes: u16 = 5,
+
+    pub const zui_inspector: zui_reflect.Options(@This()) = .{ .fields = .{
+        .interval_minutes = .{ .min = 1, .max = 60 },
+    } };
+};
+
 /// A thumbnail as a 4×4 grid of colors, produced by a background task.
 const Thumbnail = struct { colors: [4][4]zui.Color };
 
@@ -49,35 +98,31 @@ const thumbnail_rows = (thumbnail_count + thumbnail_columns - 1) / thumbnail_col
 
 const App = struct {
     io: Io,
-    view: enum { documents, thumbnails } = .documents,
+    view: enum { documents, thumbnails, settings } = .documents,
     clicks: u32 = 0,
     last_action: []const u8 = "nothing yet",
     selected_item: ?usize = 2,
     about_open: bool = false,
     thumbnails: zui.TaskPool(Io.Cancelable!Thumbnail, 96) = .init,
+    display_name_bytes: [48]u8 = undefined,
+    preferences: Preferences = undefined,
+    preference_edits: u32 = 0,
+
+    fn initPreferences(app: *App) void {
+        app.preferences = .{ .display_name = .init(&app.display_name_bytes, "Ada") };
+    }
 };
 
 const DetailsState = struct { open: bool };
 
-const ids = zui.ids(.{ "toolbar", "new", "open", "save", "documents_view", "thumbnails_view", "about", "sidebar", "content", "details_toggle", "hover_me", "dialog_close", "grid" });
+const ids = zui.ids(.{ "toolbar", "new", "open", "save", "documents_view", "thumbnails_view", "settings_view", "about", "sidebar", "content", "details_toggle", "hover_me", "dialog_close", "grid", "preferences", "save_preferences", "reset_preferences" });
 
 fn label(ui: *Ui, content: []const u8, size: f32, color: zui.Color) void {
     ui.text(content, .{ .size = size, .color = color });
 }
 
 fn button(ui: *Ui, id: zui.Id, text: []const u8) bool {
-    const state = ui.widgetState(id);
-    ui.open(.{
-        .id = id,
-        .focusable = true,
-        .layout = .{ .padding = .symmetric(14, 8), .child_alignment = .{ .x = .center, .y = .center } },
-        .background = theme.button.get(state),
-        .corner_radius = .all(6),
-        .border = if (ui.focused(id)) .{ .color = theme.focus_ring, .widths = .all(2) } else null,
-    });
-    defer ui.close();
-    label(ui, text, 20, if (state == .disabled) theme.muted_text else theme.text);
-    return ui.clicked(id);
+    return widgets.button(ui, id, text, .{});
 }
 
 fn toolbar(ui: *Ui, app: *App) void {
@@ -99,6 +144,7 @@ fn toolbar(ui: *Ui, app: *App) void {
     ui.box(.{ .layout = .{ .sizing = .{ .width = .grow } } });
     if (button(ui, ids.documents_view, "Documents")) app.view = .documents;
     if (button(ui, ids.thumbnails_view, "Thumbnails")) app.view = .thumbnails;
+    if (button(ui, ids.settings_view, "Settings")) app.view = .settings;
     if (button(ui, ids.about, "About")) app.about_open = true;
 }
 
@@ -151,7 +197,7 @@ fn mainPanel(ui: *Ui, app: *App) void {
         ui.open(.{ .id = ids.hover_me, .interactive = true, .layout = .{ .padding = .symmetric(14, 8) }, .background = theme.button.get(ui.widgetState(ids.hover_me)), .corner_radius = .all(6) });
         defer ui.close();
         label(ui, "Hover me", 20, theme.text);
-        if (ui.hovered(ids.hover_me)) {
+        if (ui.hovered(ids.hover_me) and app.preferences.show_tooltips) {
             ui.open(.{
                 .floating = .{ .anchor = .top_center, .attach_point = .bottom_center, .offset = .{ 0, 8 } },
                 .layout = .{ .padding = .symmetric(10, 6) },
@@ -253,6 +299,57 @@ fn thumbnailCell(ui: *Ui, app: *App, index: usize) void {
     }
 }
 
+fn settingsView(ui: *Ui, app: *App) void {
+    ui.open(.{ .layout = .{ .sizing = .grow_both, .padding = .all(24), .child_gap = 24 } });
+    defer ui.close();
+
+    ui.open(.{
+        .id = .of("preferences_scroll"),
+        .scroll = .{},
+        .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .fixed(620), .height = .grow }, .padding = .all(16), .child_gap = 12 },
+        .background = theme.panel,
+        .corner_radius = .all(8),
+        .border = .{ .color = theme.border, .widths = .all(1) },
+    });
+    label(ui, "Preferences", 30, theme.text);
+    label(ui, "Generated by zui_reflect.inspector from the Preferences struct.", 20, theme.muted_text);
+    if (zui_reflect.inspector(widgets, ui, ids.preferences, &app.preferences)) app.preference_edits += 1;
+    ui.open(.{ .layout = .{ .child_gap = 8 } });
+    if (widgets.button(ui, ids.save_preferences, "Save", .{})) app.preferences.times_saved += 1;
+    if (widgets.button(ui, ids.reset_preferences, "Reset", .{})) {
+        const times_saved = app.preferences.times_saved;
+        app.initPreferences();
+        app.preferences.times_saved = times_saved;
+    }
+    ui.close();
+    ui.close();
+
+    const preferences = &app.preferences;
+    const card_color: zui.Color = switch (preferences.color_scheme) {
+        .midnight => .rgb(0x20202a),
+        .dusk => .rgb(0x3a2a3e),
+        .high_contrast => .black,
+    };
+    ui.open(.{
+        .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .grow }, .padding = .all(20), .child_gap = 10 },
+        .background = card_color,
+        .corner_radius = .all(8),
+        .border = .{ .color = if (preferences.color_scheme == .high_contrast) .white else theme.border, .widths = .all(1) },
+    });
+    defer ui.close();
+    var buffer: [160]u8 = undefined;
+    const greeting = std.fmt.bufPrint(&buffer, "Hello, {s}!", .{if (preferences.display_name.len == 0) "stranger" else preferences.display_name.slice()}) catch "Hello!";
+    label(ui, greeting, @as(f32, @floatFromInt(preferences.font_size)) * preferences.interface_scale, theme.text);
+    const autosave = if (preferences.autosave.enabled)
+        std.fmt.bufPrint(buffer[80..], "Autosaving every {d} min", .{preferences.autosave.interval_minutes}) catch ""
+    else
+        "Autosave is off";
+    label(ui, autosave, 20, theme.muted_text);
+    var counts_buffer: [80]u8 = undefined;
+    const counts = std.fmt.bufPrint(&counts_buffer, "Edits: {d}   Saves: {d}", .{ app.preference_edits, preferences.times_saved }) catch "";
+    label(ui, counts, 20, theme.muted_text);
+}
+
 fn aboutDialog(ui: *Ui, app: *App) void {
     if (!app.about_open) return;
     if (ui.keyPressed(.escape)) app.about_open = false;
@@ -289,6 +386,7 @@ fn declare(ui: *Ui, app: *App) void {
             ui.close();
         },
         .thumbnails => thumbnailGrid(ui, app),
+        .settings => settingsView(ui, app),
     }
     aboutDialog(ui, app);
 }
@@ -297,6 +395,7 @@ const Options = struct {
     screenshot_path: ?[:0]const u8 = null,
     about_open: bool = false,
     thumbnails: bool = false,
+    settings: bool = false,
     hidden: bool = false,
 };
 
@@ -313,10 +412,12 @@ fn parseOptions(arguments: []const [:0]const u8) !Options {
             options.about_open = true;
         } else if (std.mem.eql(u8, argument, "--thumbnails")) {
             options.thumbnails = true;
+        } else if (std.mem.eql(u8, argument, "--settings")) {
+            options.settings = true;
         } else if (std.mem.eql(u8, argument, "--hidden")) {
             options.hidden = true;
         } else {
-            std.debug.print("unknown argument \"{s}\"; expected --screenshot <path>, --about, --thumbnails or --hidden\n", .{argument});
+            std.debug.print("unknown argument \"{s}\"; expected --screenshot <path>, --about, --thumbnails, --settings or --hidden\n", .{argument});
             return error.UnknownArgument;
         }
     }
@@ -336,7 +437,12 @@ pub fn main(init: std.process.Init) !void {
     var ui = try Ui.init(init.gpa, init.io, &platform);
     defer ui.deinit(init.gpa);
 
-    var app: App = .{ .io = init.io, .about_open = options.about_open, .view = if (options.thumbnails) .thumbnails else .documents };
+    var app: App = .{
+        .io = init.io,
+        .about_open = options.about_open,
+        .view = if (options.thumbnails) .thumbnails else if (options.settings) .settings else .documents,
+    };
+    app.initPreferences();
     defer app.thumbnails.deinit(&ui);
     const offscreen = if (screenshot_mode) c.LoadRenderTexture(c.GetScreenWidth(), c.GetScreenHeight()) else undefined;
     defer if (screenshot_mode) c.UnloadRenderTexture(offscreen);
@@ -356,6 +462,14 @@ pub fn main(init: std.process.Init) !void {
                 .thumbnails => {
                     input.pointer = if (ui.rectOf(ids.grid)) |rect| centerOf(rect) else null;
                     if (frame_number == 5) input.wheel = .{ 0, 3000 };
+                },
+                // Click the color scheme dropdown open, then rest the
+                // pointer on its last option so it shows hover state.
+                .settings => {
+                    const dropdown = ids.preferences.child("color_scheme");
+                    const target = if (frame_number < 3) dropdown else dropdown.indexedChild("option", 2);
+                    input.pointer = if (ui.rectOf(target)) |rect| centerOf(rect) else null;
+                    if (frame_number == 1) input.buttons = .initOne(.primary);
                 },
             }
         }
@@ -396,10 +510,12 @@ fn centerOf(rect: zui.Rect) [2]f32 {
 }
 
 /// Documents: three frames (lay out, hover, show the tooltip). Thumbnails:
-/// once some loads have finished and others are still pending.
+/// once some loads have finished and others are still pending. Settings:
+/// once the dropdown is open with an option hovered.
 fn screenshotReady(app: *const App, frame_number: u32) bool {
     return switch (app.view) {
         .documents => frame_number == 2,
         .thumbnails => app.thumbnails.stats.completed >= 20 or frame_number > 600,
+        .settings => frame_number == 5,
     };
 }

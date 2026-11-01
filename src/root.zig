@@ -6,6 +6,8 @@ const std = @import("std");
 /// The zui this backend is built against; import it from here so the
 /// application and the backend always agree on zui's types.
 pub const zui = @import("zui");
+pub const zui_widgets = @import("zui_widgets");
+pub const zui_reflect = @import("zui_reflect");
 
 /// The raw raylib bindings, translated from raylib.h.
 pub const c = @import("raylib");

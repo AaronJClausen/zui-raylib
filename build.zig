@@ -15,6 +15,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zui", .module = zui_module },
+            .{ .name = "zui_widgets", .module = zui_dependency.module("zui_widgets") },
+            .{ .name = "zui_reflect", .module = zui_dependency.module("zui_reflect") },
             .{ .name = "raylib", .module = raylib_module },
         },
     });

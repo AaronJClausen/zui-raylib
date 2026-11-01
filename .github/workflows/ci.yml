@@ -58,6 +58,7 @@ jobs:
           xvfb-run --auto-servernum zig build demo -- --screenshot "$PWD/demo.png"
           xvfb-run --auto-servernum zig build demo -- --screenshot "$PWD/demo-about.png" --about
           xvfb-run --auto-servernum zig build demo -- --screenshot "$PWD/demo-thumbnails.png" --thumbnails 2>&1 | tee thumbnails.log
+          xvfb-run --auto-servernum zig build demo -- --screenshot "$PWD/demo-settings.png" --settings
       - name: Check that scrolling canceled pending thumbnail loads
         run: |
           grep -E "thumbnail loads: started [0-9]+, completed [0-9]+, canceled [1-9][0-9]*" thumbnails.log
