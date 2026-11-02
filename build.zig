@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zui_raylib", .module = backend_module }},
         }),
     });
+    if (target.result.os.tag == .windows) demo.subsystem = .windows;
     b.installArtifact(demo);
 
     const run_demo = b.addRunArtifact(demo);
