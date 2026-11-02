@@ -10,6 +10,7 @@ commands. It also contains zui's reference application.
 ## Requirements
 
 - Zig **0.16.0**
+- zui, fetched automatically
 - raylib **6.0**, fetched automatically. It is the newest raylib release
   whose build supports Zig 0.16.
 - On Linux, raylib's X11 and OpenGL development packages:
@@ -47,6 +48,18 @@ The demo shows every zui feature through 0.4:
 ![The generated settings editor with its dropdown open](docs/settings.png)
 
 Press Tab and Shift-Tab to move focus, and Enter or Space to activate.
+
+## Developing against a local zui
+
+`build.zig.zon` pins zui to a commit. To build against a zui working copy
+instead, without editing it:
+
+```sh
+zig build test --fork=../zui
+```
+
+To move the pin, push the zui change and run
+`zig fetch --save=zui git+https://github.com/AaronJClausen/zui#<commit>`.
 
 ## Use it in your application
 
