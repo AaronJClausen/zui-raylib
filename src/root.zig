@@ -1,5 +1,5 @@
-//! zui-raylib: renders zui frames with raylib and reads raylib input into
-//! `zui.Input`. See README.md for usage.
+//! zui-raylib: renders zui frames with raylib and turns raylib's input into
+//! frame records. See README.md for usage.
 
 const std = @import("std");
 
@@ -8,6 +8,8 @@ const std = @import("std");
 pub const zui = @import("zui");
 pub const zui_widgets = @import("zui_widgets");
 pub const zui_reflect = @import("zui_reflect");
+pub const zui_async = @import("zui_async");
+pub const zui_tracy = @import("zui_tracy");
 
 /// The raw raylib bindings, translated from raylib.h.
 pub const c = @import("raylib");
@@ -18,60 +20,50 @@ pub const Texture = c.Texture2D;
 /// raylib itself exposes no way to wake its event wait from another thread.
 extern fn glfwPostEmptyEvent() void;
 
-/// A `zui.Config` with raylib textures as image payloads; override any
-/// field: `zui.Context(zui_raylib.config(.{ .max_elements = 8192 }), zui_raylib.Platform)`.
+/// A `zui.Config` whose text is measured by `Text` and whose images are
+/// raylib textures; override any field:
+/// `zui.Context(zui_raylib.config(.{ .limits = .{ .max_elements = 8192 } }))`.
 pub fn config(overrides: zui.Config) zui.Config {
     var result = overrides;
+    result.Text = Text;
     result.ImageHandle = Texture;
     return result;
 }
 
-/// Text measurement through raylib fonts. `FontId` indexes `fonts`; with no
-/// fonts loaded, raylib's built-in font is used for every id.
-pub const Platform = struct {
+/// The text contract, through raylib fonts. `FontId` indexes `fonts`; with
+/// no fonts loaded, raylib's built-in font is used for every id.
+pub const Text = struct {
     fonts: []const c.Font = &.{},
-    /// Extra space between glyphs, as a fraction of the font size. raylib's
-    /// own `DrawText` uses 0.1.
-    letter_spacing: f32 = 0.1,
+    /// Space raylib's fonts need between glyphs, as a fraction of the size,
+    /// before the style's own letter spacing. raylib's `DrawText` uses 0.1.
+    font_spacing: f32 = 0.1,
 
-    /// Each glyph counts its advance plus the letter spacing after it, so
-    /// that measuring "a", " " and "b" separately adds up to measuring
-    /// "a b". zui measures words and spaces separately and sums them while
-    /// wrapping; raylib's `MeasureTextEx` leaves out the spacing after the
-    /// last glyph, which on its own under-measures every word and space.
-    pub fn measureText(self: *Platform, text: []const u8, font: u16, size: f32) [2]f32 {
-        const raylib_font = self.fontFor(font);
-        const glyph_spacing = self.spacing(size);
+    /// Each glyph counts its advance plus the spacing after it, so that
+    /// measuring "a", " " and "b" separately adds up to measuring "a b",
+    /// which zui relies on when it wraps. raylib's `MeasureTextEx` leaves
+    /// out the spacing after the last glyph.
+    pub fn zuiMeasure(self: *Text, run: []const u8, key: zui.MeasureKey(u16)) [2]f32 {
+        const raylib_font = self.fontFor(key.font);
+        const glyph_spacing = self.spacing(key.size, key.letter_spacing);
         var width: f32 = 0;
-        var height: f32 = size;
-        var chunks: CStringChunks = .init(text);
+        var height: f32 = key.size;
+        var chunks: CStringChunks = .init(run);
         while (chunks.next()) |chunk| {
-            const measured = c.MeasureTextEx(raylib_font, chunk.ptr, size, glyph_spacing);
+            const measured = c.MeasureTextEx(raylib_font, chunk.ptr, key.size, glyph_spacing);
             width += measured.x + glyph_spacing;
             height = @max(height, measured.y);
         }
         return .{ width, height };
     }
 
-    /// zui snaps command bounds to whole pixels when this is declared.
-    pub fn scale(_: *const Platform) f32 {
-        return 1;
-    }
-
-    /// Called by zui from task threads when a task completes. Ends raylib's
-    /// event wait (`EnableEventWaiting`) so the result is drawn without
-    /// waiting for input. GLFW documents this function as callable from any
-    /// thread.
-    pub fn wake(_: *Platform) void {
-        glfwPostEmptyEvent();
-    }
-
-    pub fn fontFor(self: *const Platform, font: u16) c.Font {
+    pub fn fontFor(self: *const Text, font: u16) c.Font {
         return if (font < self.fonts.len) self.fonts[font] else c.GetFontDefault();
     }
 
-    pub fn spacing(self: *const Platform, size: f32) f32 {
-        return size * self.letter_spacing;
+    /// raylib's spacing between glyphs for text of `size` with the style's
+    /// `letter_spacing`.
+    pub fn spacing(self: *const Text, size: f32, letter_spacing: f32) f32 {
+        return size * self.font_spacing + letter_spacing;
     }
 };
 
@@ -101,49 +93,158 @@ const CStringChunks = struct {
 };
 
 // =====================================================================
-// Input
+// The host side: input, waking, waiting and requests
 // =====================================================================
 
-const key_map = [_]struct { raylib: c_int, zui: zui.Key }{
-    .{ .raylib = c.KEY_TAB, .zui = .tab },
-    .{ .raylib = c.KEY_ENTER, .zui = .enter },
-    .{ .raylib = c.KEY_KP_ENTER, .zui = .enter },
-    .{ .raylib = c.KEY_ESCAPE, .zui = .escape },
-    .{ .raylib = c.KEY_SPACE, .zui = .space },
-    .{ .raylib = c.KEY_BACKSPACE, .zui = .backspace },
-    .{ .raylib = c.KEY_DELETE, .zui = .delete },
-    .{ .raylib = c.KEY_LEFT, .zui = .left },
-    .{ .raylib = c.KEY_RIGHT, .zui = .right },
-    .{ .raylib = c.KEY_UP, .zui = .up },
-    .{ .raylib = c.KEY_DOWN, .zui = .down },
-    .{ .raylib = c.KEY_HOME, .zui = .home },
-    .{ .raylib = c.KEY_END, .zui = .end },
-    .{ .raylib = c.KEY_PAGE_UP, .zui = .page_up },
-    .{ .raylib = c.KEY_PAGE_DOWN, .zui = .page_down },
+/// The host's monotonic clock, for frame records.
+pub fn now(io: std.Io) zui.Instant {
+    return .fromTimestamp(std.Io.Timestamp.now(io, .awake));
+}
+
+/// The viewport and scale of raylib's window, for frame records.
+pub fn windowParams(at: zui.Instant) zui.FrameParams {
+    const screen_width = c.GetScreenWidth();
+    return .{
+        .now = at,
+        .viewport = .{ @floatFromInt(screen_width), @floatFromInt(c.GetScreenHeight()) },
+        .scale = if (screen_width > 0) @as(f32, @floatFromInt(c.GetRenderWidth())) / @as(f32, @floatFromInt(screen_width)) else 1,
+    };
+}
+
+/// Ends raylib's event wait from any thread. GLFW documents
+/// `glfwPostEmptyEvent` as callable from any thread, and the empty event
+/// stays queued until the next wait, so the wake is sticky.
+pub fn wake() void {
+    glfwPostEmptyEvent();
+}
+
+/// A `zui.Waker` for sources' producers, calling `wake`.
+pub fn waker() zui.Waker {
+    return .{ .context = &waker_context, .wakeFn = wakeErased };
+}
+
+var waker_context: u8 = 0;
+
+fn wakeErased(_: *anyopaque) void {
+    wake();
+}
+
+/// Sleeps as `zui.NextFrame` says, inside raylib's `EndDrawing`, which waits
+/// for events after presenting when event waiting is on. A deadline is met
+/// by a timer that wakes the wait at that instant.
+///
+/// ```zig
+/// pacer.prepare(ui.nextFrame(&app.sources)); // after the loader
+/// c.EndDrawing();
+/// ```
+pub const FramePacer = struct {
+    io: std.Io,
+    timers: std.Io.Group = .init,
+    scheduled_deadline: ?zui.Instant = null,
+
+    /// Call after the loader and before `EndDrawing`, so a producer's wake
+    /// after `nextFrame` stays queued for the wait.
+    pub fn prepare(self: *FramePacer, next: zui.NextFrame) void {
+        switch (next) {
+            .immediately => c.DisableEventWaiting(),
+            .on_event => c.EnableEventWaiting(),
+            .at => |deadline| {
+                c.EnableEventWaiting();
+                if (self.scheduled_deadline) |scheduled| if (scheduled.nanoseconds == deadline.nanoseconds) return;
+                self.scheduled_deadline = deadline;
+                self.timers.concurrent(self.io, wakeAt, .{ self.io, deadline }) catch c.DisableEventWaiting();
+            },
+        }
+    }
+
+    /// Stops the timers. Call before closing the window.
+    pub fn deinit(self: *FramePacer) void {
+        self.timers.cancel(self.io);
+    }
+
+    /// A sleep may end a little early, and a frame woken before its
+    /// deadline would ask for the same instant again, which `prepare` does
+    /// not schedule twice, so this wakes only once the deadline has passed.
+    fn wakeAt(io: std.Io, deadline: zui.Instant) std.Io.Cancelable!void {
+        while (now(io).isBefore(deadline)) {
+            const remaining = deadline.nanoseconds -| now(io).nanoseconds;
+            try io.sleep(.fromNanoseconds(@intCast(remaining)), .awake);
+        }
+        wake();
+    }
 };
+
+/// Applies what a frame asks of the host that raylib can do: the cursor.
+/// raylib has no IME window to place.
+pub const HostRequestApplier = struct {
+    applied_cursor: ?zui.Cursor = null,
+
+    pub fn apply(self: *HostRequestApplier, requests: zui.HostRequests) void {
+        if (self.applied_cursor == requests.cursor) return;
+        self.applied_cursor = requests.cursor;
+        c.SetMouseCursor(mouseCursorFor(requests.cursor));
+    }
+};
+
+/// The nearest of raylib's cursors.
+pub fn mouseCursorFor(cursor: zui.Cursor) c_int {
+    return switch (cursor) {
+        .default, .wait, .progress, .help => c.MOUSE_CURSOR_DEFAULT,
+        .pointer, .grab => c.MOUSE_CURSOR_POINTING_HAND,
+        .text => c.MOUSE_CURSOR_IBEAM,
+        .crosshair => c.MOUSE_CURSOR_CROSSHAIR,
+        .move, .grabbing => c.MOUSE_CURSOR_RESIZE_ALL,
+        .not_allowed => c.MOUSE_CURSOR_NOT_ALLOWED,
+        .resize_horizontal => c.MOUSE_CURSOR_RESIZE_EW,
+        .resize_vertical => c.MOUSE_CURSOR_RESIZE_NS,
+        .resize_nwse => c.MOUSE_CURSOR_RESIZE_NWSE,
+        .resize_nesw => c.MOUSE_CURSOR_RESIZE_NESW,
+    };
+}
 
 pub const InputOptions = struct {
     /// Layout units scrolled per notch of the mouse wheel.
     wheel_step: f32 = 40,
 };
 
-/// Owns the memory `zui.Input`'s slices point into; keep it alive until
-/// `beginFrame` returns (a local variable around the frame is enough).
+/// Turns the state raylib polled into a frame record's events. raylib
+/// reports state, not events, so this goes through `zui.InputSampler`; a
+/// press and release between two polls is lost, as it is to raylib.
 pub const InputReader = struct {
-    keys: [zui.max_keys_per_frame]zui.Key = undefined,
-    text: [zui.max_text_input_bytes]u8 = undefined,
+    pub const max_keys = 64;
+    pub const max_text_bytes = 256;
+    pub const event_capacity = 3 * max_keys;
 
-    pub fn read(self: *InputReader, options: InputOptions) zui.Input {
+    sampler: zui.InputSampler = .{},
+    keys: [max_keys]zui.Key = undefined,
+    text: [max_text_bytes]u8 = undefined,
+    events: [event_capacity]zui.Event = undefined,
+    window_focused: bool = true,
+
+    /// The events since the last read. They point into the reader, so they
+    /// stay valid until the next read; `beginFrame` copies them.
+    pub fn read(self: *InputReader, at: zui.Instant, options: InputOptions) []const zui.Event {
+        return self.eventsFor(at, self.sample(options));
+    }
+
+    /// What raylib polled, as one sample.
+    pub fn sample(self: *InputReader, options: InputOptions) zui.InputSampler.Sample {
         var buttons: std.EnumSet(zui.Button) = .initEmpty();
         if (c.IsMouseButtonDown(c.MOUSE_BUTTON_LEFT)) buttons.insert(.primary);
         if (c.IsMouseButtonDown(c.MOUSE_BUTTON_RIGHT)) buttons.insert(.secondary);
         if (c.IsMouseButtonDown(c.MOUSE_BUTTON_MIDDLE)) buttons.insert(.middle);
 
         var key_count: usize = 0;
-        for (key_map) |mapping| {
+        while (key_count < self.keys.len) {
+            const raylib_key = c.GetKeyPressed();
+            if (raylib_key == 0) break;
+            self.keys[key_count] = keyFor(raylib_key);
+            key_count += 1;
+        }
+        for (repeating_keys) |raylib_key| {
             if (key_count == self.keys.len) break;
-            if (c.IsKeyPressed(mapping.raylib) or c.IsKeyPressedRepeat(mapping.raylib)) {
-                self.keys[key_count] = mapping.zui;
+            if (c.IsKeyPressedRepeat(raylib_key)) {
+                self.keys[key_count] = keyFor(raylib_key);
                 key_count += 1;
             }
         }
@@ -157,8 +258,6 @@ pub const InputReader = struct {
 
         const pointer = c.GetMousePosition();
         return .{
-            .viewport = .{ @floatFromInt(c.GetScreenWidth()), @floatFromInt(c.GetScreenHeight()) },
-            .dt_seconds = c.GetFrameTime(),
             .pointer = if (c.IsCursorOnScreen()) .{ pointer.x, pointer.y } else null,
             .buttons = buttons,
             .wheel = wheelToScroll(c.GetMouseWheelMoveV(), options.wheel_step),
@@ -169,10 +268,71 @@ pub const InputReader = struct {
                 .alt = c.IsKeyDown(c.KEY_LEFT_ALT) or c.IsKeyDown(c.KEY_RIGHT_ALT),
                 .super = c.IsKeyDown(c.KEY_LEFT_SUPER) or c.IsKeyDown(c.KEY_RIGHT_SUPER),
             },
-            .text_input = self.text[0..text_length],
+            .text = self.text[0..text_length],
         };
     }
+
+    /// The events between the previous sample and `current`, then a focus
+    /// change if the window gained or lost focus.
+    pub fn eventsFor(self: *InputReader, at: zui.Instant, current: zui.InputSampler.Sample) []const zui.Event {
+        var count = self.sampler.sample(at, current, self.events[0 .. self.events.len - 1]).len;
+        const focused = c.IsWindowFocused();
+        if (focused != self.window_focused) {
+            self.window_focused = focused;
+            self.events[count] = .{ .environment = .{ .window_focused = focused } };
+            count += 1;
+        }
+        return self.events[0..count];
+    }
 };
+
+/// Keys raylib repeats while held that a UI acts on again.
+const repeating_keys = [_]c_int{
+    c.KEY_TAB, c.KEY_ENTER, c.KEY_BACKSPACE, c.KEY_DELETE, c.KEY_LEFT,    c.KEY_RIGHT,
+    c.KEY_UP,  c.KEY_DOWN,  c.KEY_HOME,      c.KEY_END,    c.KEY_PAGE_UP, c.KEY_PAGE_DOWN,
+};
+
+/// raylib's key codes are GLFW's, which name keys by the US layout.
+pub fn keyFor(raylib_key: c_int) zui.Key {
+    if (raylib_key >= c.KEY_A and raylib_key <= c.KEY_Z) return @enumFromInt(@intFromEnum(zui.Key.a) + @as(u32, @intCast(raylib_key - c.KEY_A)));
+    if (raylib_key >= c.KEY_ZERO and raylib_key <= c.KEY_NINE) return @enumFromInt(@intFromEnum(zui.Key.digit_0) + @as(u32, @intCast(raylib_key - c.KEY_ZERO)));
+    if (raylib_key >= c.KEY_F1 and raylib_key <= c.KEY_F12) return @enumFromInt(@intFromEnum(zui.Key.f1) + @as(u32, @intCast(raylib_key - c.KEY_F1)));
+    return switch (raylib_key) {
+        c.KEY_TAB => .tab,
+        c.KEY_ENTER, c.KEY_KP_ENTER => .enter,
+        c.KEY_ESCAPE => .escape,
+        c.KEY_SPACE => .space,
+        c.KEY_BACKSPACE => .backspace,
+        c.KEY_DELETE => .delete,
+        c.KEY_INSERT => .insert,
+        c.KEY_LEFT => .left,
+        c.KEY_RIGHT => .right,
+        c.KEY_UP => .up,
+        c.KEY_DOWN => .down,
+        c.KEY_HOME => .home,
+        c.KEY_END => .end,
+        c.KEY_PAGE_UP => .page_up,
+        c.KEY_PAGE_DOWN => .page_down,
+        c.KEY_KB_MENU => .menu,
+        c.KEY_LEFT_SHIFT, c.KEY_RIGHT_SHIFT => .shift,
+        c.KEY_LEFT_CONTROL, c.KEY_RIGHT_CONTROL => .control,
+        c.KEY_LEFT_ALT, c.KEY_RIGHT_ALT => .alt,
+        c.KEY_LEFT_SUPER, c.KEY_RIGHT_SUPER => .super,
+        c.KEY_CAPS_LOCK => .caps_lock,
+        c.KEY_MINUS => .minus,
+        c.KEY_EQUAL => .equals,
+        c.KEY_LEFT_BRACKET => .left_bracket,
+        c.KEY_RIGHT_BRACKET => .right_bracket,
+        c.KEY_BACKSLASH => .backslash,
+        c.KEY_SEMICOLON => .semicolon,
+        c.KEY_APOSTROPHE => .apostrophe,
+        c.KEY_GRAVE => .grave,
+        c.KEY_COMMA => .comma,
+        c.KEY_PERIOD => .period,
+        c.KEY_SLASH => .slash,
+        else => .unidentified,
+    };
+}
 
 /// raylib reports wheel movement as positive when scrolling up (toward the
 /// start); zui wants positive toward the end, in layout units.
@@ -198,7 +358,7 @@ pub fn RenderOptions(comptime Command: type) type {
         /// Required when `Config.CustomData` is not void.
         draw_custom: ?*const fn (data: @FieldType(Payload, "custom"), bounds: zui.Rect) void = null,
         /// Required when `Config.ImageHandle` is not `zui_raylib.Texture`.
-        draw_image: ?*const fn (handle: @FieldType(Payload, "image"), bounds: zui.Rect) void = null,
+        draw_image: ?*const fn (handle: @FieldType(@FieldType(Payload, "image"), "handle"), bounds: zui.Rect) void = null,
         /// Segments per rounded corner; raylib picks automatically at 0.
         corner_segments: c_int = 0,
     };
@@ -208,28 +368,28 @@ pub fn RenderOptions(comptime Command: type) type {
 /// `BeginTextureMode`) and `EndDrawing`.
 ///
 /// ```zig
-/// const frame = ui.endFrame() catch ui.lastFrame();
+/// const frame = ui.endFrame();
 /// c.BeginDrawing();
 /// c.ClearBackground(.{ .r = 30, .g = 30, .b = 36, .a = 255 });
-/// zui_raylib.render(Ui.RenderCommand, &platform, frame.commands(), .{});
+/// zui_raylib.render(Ui.RenderCommand, &text, frame.commands(), .{});
 /// c.EndDrawing();
 /// ui.release(frame);
 /// ```
-pub fn render(comptime Command: type, platform: *const Platform, commands: []const Command, options: RenderOptions(Command)) void {
+pub fn render(comptime Command: type, text: *const Text, commands: []const Command, options: RenderOptions(Command)) void {
     const Payload = @FieldType(Command, "payload");
-    const ImageHandle = @FieldType(Payload, "image");
+    const ImageHandle = @FieldType(@FieldType(Payload, "image"), "handle");
     var scissors: ScissorStack = .{};
     for (commands) |command| {
         const bounds = command.bounds;
         switch (command.payload) {
             .rectangle => |rectangle| drawRectangle(bounds, rectangle.color, rectangle.corner_radius, options.corner_segments),
             .border => |border| drawBorder(bounds, border.color, border.widths, border.corner_radius, options.corner_segments),
-            .text => |text| drawText(platform, text.content, bounds, text.style.font, text.style.size, text.style.color),
-            .image => |handle| {
+            .text => |line| drawText(text, line.content, bounds, line.style.font, line.style.size, line.style.letter_spacing, line.style.color),
+            .image => |image| {
                 if (ImageHandle == Texture) {
-                    drawTexture(handle, bounds);
+                    drawTexture(image.handle, bounds);
                 } else if (options.draw_image) |draw_image| {
-                    draw_image(handle, bounds);
+                    draw_image(image.handle, bounds);
                 }
             },
             .custom => |data| if (options.draw_custom) |draw_custom| draw_custom(data, bounds),
@@ -280,9 +440,9 @@ fn drawBorder(bounds: zui.Rect, color: zui.Color, widths: zui.Edges, radius: zui
     c.DrawRectangleRec(.{ .x = bounds.x + bounds.width - widths.right, .y = bounds.y + widths.top, .width = widths.right, .height = bounds.height - widths.top - widths.bottom }, raylib_color);
 }
 
-fn drawText(platform: *const Platform, content: []const u8, bounds: zui.Rect, font: u16, size: f32, color: zui.Color) void {
-    const raylib_font = platform.fontFor(font);
-    const spacing = platform.spacing(size);
+fn drawText(text: *const Text, content: []const u8, bounds: zui.Rect, font: u16, size: f32, letter_spacing: f32, color: zui.Color) void {
+    const raylib_font = text.fontFor(font);
+    const spacing = text.spacing(size, letter_spacing);
     var x = bounds.x;
     var chunks: CStringChunks = .init(content);
     while (chunks.next()) |chunk| {
@@ -365,8 +525,28 @@ test "typed code points are encoded as UTF-8" {
     try std.testing.expectEqual(@as(usize, 0), encodeCodepoint('€', buffer[0..2]));
 }
 
-test "config makes images raylib textures" {
-    const derived = config(.{ .max_elements = 128 });
+test "raylib's keys map to zui's, letters and function keys included" {
+    try std.testing.expectEqual(zui.Key.s, keyFor(c.KEY_S));
+    try std.testing.expectEqual(zui.Key.digit_7, keyFor(c.KEY_SEVEN));
+    try std.testing.expectEqual(zui.Key.f12, keyFor(c.KEY_F12));
+    try std.testing.expectEqual(zui.Key.page_down, keyFor(c.KEY_PAGE_DOWN));
+    try std.testing.expectEqual(zui.Key.unidentified, keyFor(c.KEY_KP_5));
+}
+
+test "the spacing after each glyph adds the style's letter spacing" {
+    const text: Text = .{};
+    try std.testing.expectEqual(@as(f32, 2), text.spacing(20, 0));
+    try std.testing.expectEqual(@as(f32, 5), text.spacing(20, 3));
+}
+
+test "every cursor maps to one of raylib's" {
+    try std.testing.expectEqual(@as(c_int, c.MOUSE_CURSOR_IBEAM), mouseCursorFor(.text));
+    try std.testing.expectEqual(@as(c_int, c.MOUSE_CURSOR_POINTING_HAND), mouseCursorFor(.pointer));
+}
+
+test "config makes text raylib's and images raylib textures" {
+    const derived = config(.{ .limits = .{ .max_elements = 128 } });
     try std.testing.expect(derived.ImageHandle == Texture);
-    try std.testing.expectEqual(@as(u32, 128), derived.max_elements);
+    try std.testing.expect(derived.Text == Text);
+    try std.testing.expectEqual(@as(u32, 128), derived.limits.max_elements);
 }

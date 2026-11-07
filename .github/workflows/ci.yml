@@ -31,7 +31,7 @@ jobs:
   windows:
     name: Test and build (Windows)
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -43,7 +43,7 @@ jobs:
   linux:
     name: Test, build and render (Linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -59,9 +59,13 @@ jobs:
           xvfb-run --auto-servernum zig build demo -- --screenshot "$PWD/demo-about.png" --about
           xvfb-run --auto-servernum zig build demo -- --screenshot "$PWD/demo-thumbnails.png" --thumbnails 2>&1 | tee thumbnails.log
           xvfb-run --auto-servernum zig build demo -- --screenshot "$PWD/demo-settings.png" --settings
-      - name: Check that scrolling canceled pending thumbnail loads
+      - name: Check that scrolling abandoned the loads of rows that went unread
         run: |
           grep -E "thumbnail loads: started [0-9]+, completed [0-9]+, canceled [1-9][0-9]*" thumbnails.log
+      - name: Report the CPU used while idle
+        run: |
+          timeout 60 xvfb-run --auto-servernum zig build demo -- --measure-idle --thumbnails 2>&1 | grep "^idle" | tee idle.log
+          echo "Thumbnail grid, $(cat idle.log)" >> "$GITHUB_STEP_SUMMARY"
       - name: Keep the renders
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -71,7 +75,7 @@ jobs:
   macos:
     name: Build (macOS)
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1

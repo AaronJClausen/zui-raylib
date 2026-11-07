@@ -7,17 +7,26 @@
 //! zig build demo -- --screenshot grid.png --thumbnails  # ...in the thumbnail grid
 //! zig build demo -- --screenshot settings.png --settings # ...in the generated settings editor
 //! zig build demo -- --hidden                            # run interactively in a hidden window
+//! zig build demo -- --measure-idle [--thumbnails]       # report the CPU time used over 10 idle seconds
 //! ```
 
 const std = @import("std");
-const Io = std.Io;
 const zui_raylib = @import("zui_raylib");
 const zui = zui_raylib.zui;
 const zui_widgets = zui_raylib.zui_widgets;
 const zui_reflect = zui_raylib.zui_reflect;
+const zui_tracy = zui_raylib.zui_tracy;
 const c = zui_raylib.c;
+const thumbnails = @import("thumbnails.zig");
 
-const Ui = zui.Context(zui_raylib.config(.{ .max_elements = 4096 }), zui_raylib.Platform);
+const AppSources = struct {
+    thumbnails: thumbnails.Loads = .{},
+};
+
+const Ui = zui.Context(zui_raylib.config(.{
+    .Sources = AppSources,
+    .features = .{ .Tracer = zui_tracy.Tracer },
+}));
 
 const Theme = struct {
     background: zui.Color = .rgb(0x16161c),
@@ -66,7 +75,7 @@ const Preferences = struct {
     font_size: u8 = 20,
     show_tooltips: bool = true,
     autosave: Autosave = .{},
-    build: []const u8 = "zui 0.5.0, zui-raylib 0.3.0",
+    build: []const u8 = "zui-raylib 0.4.0",
     times_saved: u32 = 0,
 
     pub const zui_inspector: zui_reflect.Options(@This()) = .{ .fields = .{
@@ -86,30 +95,44 @@ const Autosave = struct {
     } };
 };
 
-/// A thumbnail as a 4×4 grid of colors, produced by a background task.
-const Thumbnail = struct { colors: [4][4]zui.Color };
-
-const thumbnail_count = 600;
 const thumbnail_columns = 7;
 const thumbnail_size = 120;
 const thumbnail_gap = 12;
 const thumbnail_pitch = thumbnail_size + thumbnail_gap;
-const thumbnail_rows = (thumbnail_count + thumbnail_columns - 1) / thumbnail_columns;
+const thumbnail_rows = (thumbnails.count + thumbnail_columns - 1) / thumbnail_columns;
 
 const App = struct {
-    io: Io,
     view: enum { documents, thumbnails, settings } = .documents,
     clicks: u32 = 0,
     last_action: []const u8 = "nothing yet",
     selected_item: ?usize = 2,
     about_open: bool = false,
-    thumbnails: zui.TaskPool(Io.Cancelable!Thumbnail, 96) = .init,
     display_name_bytes: [48]u8 = undefined,
     preferences: Preferences = undefined,
     preference_edits: u32 = 0,
+    sources: AppSources = .{},
+    loader: thumbnails.Loader,
+    frames: u64 = 0,
+    /// Producers' wakes of the window's event wait.
+    wakes: std.atomic.Value(u32) = .init(0),
 
     fn initPreferences(app: *App) void {
         app.preferences = .{ .display_name = .init(&app.display_name_bytes, "Ada") };
+    }
+
+    fn waker(app: *App) zui.Waker {
+        return .{ .context = app, .wakeFn = countWake };
+    }
+
+    fn countWake(context: *anyopaque) void {
+        const app: *App = @ptrCast(@alignCast(context));
+        _ = app.wakes.fetchAdd(1, .monotonic);
+        zui_raylib.wake();
+    }
+
+    /// The loader: after `endFrame`, starts the loads the frame asked for.
+    fn load(app: *App) void {
+        app.loader.startWanted(&app.sources.thumbnails, app.waker());
     }
 };
 
@@ -129,8 +152,7 @@ fn toolbar(ui: *Ui, app: *App) void {
     ui.open(.{
         .id = ids.toolbar,
         .layout = .{ .sizing = .{ .width = .grow, .height = .fixed(56) }, .padding = .symmetric(12, 8), .child_gap = 8, .child_alignment = .{ .y = .center } },
-        .background = theme.panel,
-        .border = .{ .color = theme.border, .widths = .{ .bottom = 1 } },
+        .decoration = .{ .background = theme.panel, .border = .{ .color = theme.border, .widths = .{ .bottom = 1 } } },
     });
     defer ui.close();
 
@@ -152,7 +174,7 @@ fn sidebar(ui: *Ui, app: *App) void {
     ui.open(.{
         .id = ids.sidebar,
         .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .fixed(260), .height = .grow }, .padding = .all(8), .child_gap = 4 },
-        .background = theme.sidebar,
+        .decoration = .{ .background = theme.sidebar },
         .scroll = .{},
     });
     defer ui.close();
@@ -165,10 +187,13 @@ fn sidebar(ui: *Ui, app: *App) void {
         ui.open(.{
             .id = id,
             .focusable = true,
+            .cursor = .pointer,
             .layout = .{ .sizing = .{ .width = .grow, .height = .fixed(36) }, .padding = .symmetric(12, 8), .child_alignment = .{ .y = .center } },
-            .background = if (selected) theme.accent else if (state == .hovered or state == .pressed) theme.button.get(.hovered) else null,
-            .corner_radius = .all(4),
-            .border = if (ui.focused(id)) .{ .color = theme.focus_ring, .widths = .all(1) } else null,
+            .decoration = .{
+                .background = if (selected) theme.accent else if (state == .hovered or state == .pressed) theme.button.get(.hovered) else null,
+                .corner_radius = .all(4),
+                .border = if (ui.focused(id)) .{ .color = theme.focus_ring, .widths = .all(1) } else null,
+            },
         });
         const name = std.fmt.bufPrint(&name_buffer, "Document {d}", .{index + 1}) catch "Document";
         label(ui, name, 20, theme.text);
@@ -187,22 +212,27 @@ fn mainPanel(ui: *Ui, app: *App) void {
     });
     defer ui.close();
 
-    label(ui, "zui + raylib", 40, theme.text);
+    ui.text("zui + raylib", .{ .size = 40, .letter_spacing = 2, .color = theme.text });
     label(ui, "This window is laid out by zui and drawn by raylib. Every element is declared each frame as nested function calls; zui computes the layout and returns render commands, and the backend draws them. Resize the window to watch this paragraph re-wrap, scroll the list on the left with the wheel, and press Tab to move focus.", 20, theme.muted_text);
 
     ui.open(.{ .layout = .{ .child_gap = 12, .child_alignment = .{ .y = .center } } });
     const details = ui.state(ids.details_toggle, DetailsState);
     if (button(ui, ids.details_toggle, if (details.open) "Hide details" else "Show details")) details.open = !details.open;
     {
-        ui.open(.{ .id = ids.hover_me, .interactive = true, .layout = .{ .padding = .symmetric(14, 8) }, .background = theme.button.get(ui.widgetState(ids.hover_me)), .corner_radius = .all(6) });
+        ui.open(.{
+            .id = ids.hover_me,
+            .interactive = true,
+            .cursor = .help,
+            .layout = .{ .padding = .symmetric(14, 8) },
+            .decoration = .{ .background = theme.button.get(ui.widgetState(ids.hover_me)), .corner_radius = .all(6) },
+        });
         defer ui.close();
         label(ui, "Hover me", 20, theme.text);
         if (ui.hovered(ids.hover_me) and app.preferences.show_tooltips) {
             ui.open(.{
                 .floating = .{ .anchor = .top_center, .attach_point = .bottom_center, .offset = .{ 0, 8 } },
                 .layout = .{ .padding = .symmetric(10, 6) },
-                .background = theme.focus_ring,
-                .corner_radius = .all(4),
+                .decoration = .{ .background = theme.focus_ring, .corner_radius = .all(4) },
             });
             label(ui, "A floating tooltip", 20, theme.background);
             ui.close();
@@ -213,9 +243,7 @@ fn mainPanel(ui: *Ui, app: *App) void {
     if (details.open) {
         ui.open(.{
             .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .grow }, .padding = .all(16), .child_gap = 6 },
-            .background = theme.panel,
-            .corner_radius = .all(8),
-            .border = .{ .color = theme.border, .widths = .all(1) },
+            .decoration = .{ .background = theme.panel, .corner_radius = .all(8), .border = .{ .color = theme.border, .widths = .all(1) } },
         });
         label(ui, "Details", 20, theme.text);
         label(ui, "This panel's open state lives in zui's state table under the toggle's id.", 20, theme.muted_text);
@@ -228,23 +256,9 @@ fn mainPanel(ui: *Ui, app: *App) void {
     label(ui, status, 20, theme.muted_text);
 }
 
-/// The background task: a slow "load" (200–800 ms of cancelable sleep)
-/// followed by colors derived from the index.
-fn loadThumbnail(io: Io, index: usize) Io.Cancelable!Thumbnail {
-    var prng: std.Random.DefaultPrng = .init(index *% 0x9E3779B97F4A7C15);
-    const random = prng.random();
-    try io.sleep(.fromMilliseconds(random.intRangeAtMost(i64, 200, 800)), .awake);
-    var thumbnail: Thumbnail = undefined;
-    const base_hue = random.int(u8);
-    for (&thumbnail.colors, 0..) |*row, row_index| for (row, 0..) |*color, column_index| {
-        const shade: u8 = @intCast(40 + (row_index + column_index) * 20);
-        color.* = .{ .r = base_hue, .g = shade, .b = 255 - base_hue / 2 };
-    };
-    return thumbnail;
-}
-
-/// Only the rows near the visible part of the grid are declared. Rows that
-/// scroll away stop being declared, so zui cancels their pending loads.
+/// Only the rows near the visible part of the grid are declared, so only
+/// their thumbnails are asked for. Keys that scroll away go unread, and
+/// once unread long enough their loads are abandoned.
 fn thumbnailGrid(ui: *Ui, app: *App) void {
     ui.open(.{ .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both, .padding = .all(16), .child_gap = 12 } });
     defer ui.close();
@@ -254,47 +268,54 @@ fn thumbnailGrid(ui: *Ui, app: *App) void {
     const first_row: usize = @intFromFloat(@max(0, @floor(offset / thumbnail_pitch) - 1));
     const last_row: usize = @min(thumbnail_rows - 1, @as(usize, @intFromFloat(@floor((offset + visible_height) / thumbnail_pitch))) + 1);
 
-    var stats_buffer: [160]u8 = undefined;
-    const stats = app.thumbnails.stats;
-    const summary = std.fmt.bufPrint(&stats_buffer, "{d} thumbnails, rows {d}-{d} declared.  Loads started {d}, completed {d}, canceled {d}", .{
-        thumbnail_count, first_row + 1, last_row + 1, stats.started, stats.completed, stats.canceled,
+    var stats_buffer: [192]u8 = undefined;
+    const loader = &app.loader;
+    const summary = std.fmt.bufPrint(&stats_buffer, "{d} thumbnails, rows {d}-{d} declared.  Loads started {d}, completed {d}, canceled {d}.  Wakes {d}, frames {d}", .{
+        thumbnails.count,
+        first_row + 1,
+        last_row + 1,
+        loader.started,
+        loader.completed.load(.monotonic),
+        loader.canceled.load(.monotonic),
+        app.wakes.load(.monotonic),
+        app.frames,
     }) catch "";
     label(ui, summary, 20, theme.muted_text);
 
     ui.open(.{ .id = ids.grid, .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both, .child_gap = thumbnail_gap }, .scroll = .{} });
     defer ui.close();
 
+    const loads = ui.source(.thumbnails);
     if (first_row > 0) ui.box(.{ .layout = .{ .sizing = .{ .height = .fixed(@as(f32, @floatFromInt(first_row)) * thumbnail_pitch - thumbnail_gap) } } });
     for (first_row..last_row + 1) |row| {
         ui.open(.{ .layout = .{ .child_gap = thumbnail_gap } });
         defer ui.close();
         for (0..thumbnail_columns) |column| {
             const index = row * thumbnail_columns + column;
-            if (index >= thumbnail_count) break;
-            thumbnailCell(ui, app, index);
+            if (index >= thumbnails.count) break;
+            thumbnailCell(ui, index, loads.get(@intCast(index)));
         }
     }
     const rows_below = thumbnail_rows - 1 - last_row;
     if (rows_below > 0) ui.box(.{ .layout = .{ .sizing = .{ .height = .fixed(@as(f32, @floatFromInt(rows_below)) * thumbnail_pitch - thumbnail_gap) } } });
 }
 
-fn thumbnailCell(ui: *Ui, app: *App, index: usize) void {
-    const id: zui.Id = .indexed("thumbnail", index);
+fn thumbnailCell(ui: *Ui, index: usize, status: thumbnails.Loads.Status) void {
     ui.open(.{
-        .id = id,
+        .id = .indexed("thumbnail", index),
         .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .fixed(thumbnail_size), .height = .fixed(thumbnail_size) }, .padding = .all(8), .child_alignment = .{ .x = .center, .y = .center } },
-        .background = theme.panel,
-        .corner_radius = .all(6),
+        .decoration = .{ .background = theme.panel, .corner_radius = .all(6) },
     });
     defer ui.close();
 
-    switch (app.thumbnails.request(ui, id, loadThumbnail, .{ app.io, index }, .{})) {
-        .pending => label(ui, "loading", 20, theme.muted_text),
-        .failed => label(ui, "canceled", 20, theme.muted_text),
+    switch (status) {
+        .idle, .running => label(ui, "loading", 20, theme.muted_text),
+        .canceled => label(ui, "canceled", 20, theme.muted_text),
+        .failed => label(ui, "failed", 20, theme.muted_text),
         .ready => |thumbnail| for (thumbnail.colors) |row| {
             ui.open(.{ .layout = .{ .sizing = .{ .width = .grow, .height = .grow } } });
             defer ui.close();
-            for (row) |color| ui.box(.{ .layout = .{ .sizing = .grow_both }, .background = color });
+            for (row) |color| ui.box(.{ .layout = .{ .sizing = .grow_both }, .decoration = .{ .background = color } });
         },
     }
 }
@@ -307,9 +328,7 @@ fn settingsView(ui: *Ui, app: *App) void {
         .id = .of("preferences_scroll"),
         .scroll = .{},
         .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .fixed(620), .height = .grow }, .padding = .all(16), .child_gap = 12 },
-        .background = theme.panel,
-        .corner_radius = .all(8),
-        .border = .{ .color = theme.border, .widths = .all(1) },
+        .decoration = .{ .background = theme.panel, .corner_radius = .all(8), .border = .{ .color = theme.border, .widths = .all(1) } },
     });
     label(ui, "Preferences", 30, theme.text);
     label(ui, "Generated by zui_reflect.inspector from the Preferences struct.", 20, theme.muted_text);
@@ -332,9 +351,11 @@ fn settingsView(ui: *Ui, app: *App) void {
     };
     ui.open(.{
         .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .grow }, .padding = .all(20), .child_gap = 10 },
-        .background = card_color,
-        .corner_radius = .all(8),
-        .border = .{ .color = if (preferences.color_scheme == .high_contrast) .white else theme.border, .widths = .all(1) },
+        .decoration = .{
+            .background = card_color,
+            .corner_radius = .all(8),
+            .border = .{ .color = if (preferences.color_scheme == .high_contrast) .white else theme.border, .widths = .all(1) },
+        },
     });
     defer ui.close();
     var buffer: [160]u8 = undefined;
@@ -358,15 +379,13 @@ fn aboutDialog(ui: *Ui, app: *App) void {
         .interactive = true,
         .floating = .{ .attach_to = .root, .z = 10 },
         .layout = .{ .sizing = .grow_both, .child_alignment = .{ .x = .center, .y = .center } },
-        .background = theme.overlay,
+        .decoration = .{ .background = theme.overlay },
     });
     defer ui.close();
     ui.open(.{
         .focus_scope = true,
         .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .fixed(420) }, .padding = .all(24), .child_gap = 14 },
-        .background = theme.panel,
-        .corner_radius = .all(10),
-        .border = .{ .color = theme.border, .widths = .all(1) },
+        .decoration = .{ .background = theme.panel, .corner_radius = .all(10), .border = .{ .color = theme.border, .widths = .all(1) } },
     });
     defer ui.close();
     label(ui, "About", 30, theme.text);
@@ -375,7 +394,7 @@ fn aboutDialog(ui: *Ui, app: *App) void {
 }
 
 fn declare(ui: *Ui, app: *App) void {
-    ui.open(.{ .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both }, .background = theme.background });
+    ui.open(.{ .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both }, .decoration = .{ .background = theme.background } });
     defer ui.close();
     toolbar(ui, app);
     switch (app.view) {
@@ -397,6 +416,7 @@ const Options = struct {
     thumbnails: bool = false,
     settings: bool = false,
     hidden: bool = false,
+    measure_idle: bool = false,
 };
 
 fn parseOptions(arguments: []const [:0]const u8) !Options {
@@ -416,8 +436,11 @@ fn parseOptions(arguments: []const [:0]const u8) !Options {
             options.settings = true;
         } else if (std.mem.eql(u8, argument, "--hidden")) {
             options.hidden = true;
+        } else if (std.mem.eql(u8, argument, "--measure-idle")) {
+            options.hidden = true;
+            options.measure_idle = true;
         } else {
-            std.debug.print("unknown argument \"{s}\"; expected --screenshot <path>, --about, --thumbnails, --settings or --hidden\n", .{argument});
+            std.debug.print("unknown argument \"{s}\"; expected --screenshot <path>, --about, --thumbnails, --settings, --hidden or --measure-idle\n", .{argument});
             return error.UnknownArgument;
         }
     }
@@ -425,6 +448,7 @@ fn parseOptions(arguments: []const [:0]const u8) !Options {
 }
 
 pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     const options = try parseOptions(try init.minimal.args.toSlice(init.arena.allocator()));
     const screenshot_mode = options.screenshot_path != null;
 
@@ -433,89 +457,192 @@ pub fn main(init: std.process.Init) !void {
     defer c.CloseWindow();
     c.SetTargetFPS(60);
 
-    var platform: zui_raylib.Platform = .{};
-    var ui = try Ui.init(init.gpa, init.io, &platform);
+    var text: zui_raylib.Text = .{};
+    var ui = try Ui.init(init.gpa, io, &text);
     defer ui.deinit(init.gpa);
 
-    var app: App = .{
-        .io = init.io,
+    const app = try init.gpa.create(App);
+    defer init.gpa.destroy(app);
+    app.* = .{
+        .loader = .{ .io = io },
         .about_open = options.about_open,
         .view = if (options.thumbnails) .thumbnails else if (options.settings) .settings else .documents,
     };
     app.initPreferences();
-    defer app.thumbnails.deinit(&ui);
+    defer app.loader.deinit();
+
+    var reader: zui_raylib.InputReader = .{};
+    var pacer: zui_raylib.FramePacer = .{ .io = io };
+    defer pacer.deinit();
+    var host_requests: zui_raylib.HostRequestApplier = .{};
+
     const offscreen = if (screenshot_mode) c.LoadRenderTexture(c.GetScreenWidth(), c.GetScreenHeight()) else undefined;
     defer if (screenshot_mode) c.UnloadRenderTexture(offscreen);
 
-    var frame_number: u32 = 0;
-    while (!c.WindowShouldClose()) : (frame_number += 1) {
-        var reader: zui_raylib.InputReader = .{};
-        var input = reader.read(.{});
-        if (screenshot_mode) {
-            input.buttons = .initEmpty();
-            switch (app.view) {
-                // Rest the pointer on "Hover me" (known from the previous frame)
-                // so the screenshot shows hover state and the tooltip.
-                .documents => input.pointer = if (ui.rectOf(ids.hover_me)) |rect| centerOf(rect) else null,
-                // Scroll far down once loads are underway, so the rows that
-                // leave the screen have their pending loads canceled.
-                .thumbnails => {
-                    input.pointer = if (ui.rectOf(ids.grid)) |rect| centerOf(rect) else null;
-                    if (frame_number == 5) input.wheel = .{ 0, 3000 };
-                },
-                // Click the color scheme dropdown open, then rest the
-                // pointer on its last option so it shows hover state.
-                .settings => {
-                    const dropdown = ids.preferences.child("color_scheme");
-                    const target = if (frame_number < 3) dropdown else dropdown.indexedChild("option", 2);
-                    input.pointer = if (ui.rectOf(target)) |rect| centerOf(rect) else null;
-                    if (frame_number == 1) input.buttons = .initOne(.primary);
-                },
-            }
-        }
+    var idle_measurement: ?IdleMeasurement = if (options.measure_idle) .{ .launched_at = zui_raylib.now(io) } else null;
 
-        ui.beginFrame(input);
-        declare(&ui, &app);
-        const frame = ui.endFrame() catch ui.lastFrame();
-        defer ui.release(frame);
+    while (!c.WindowShouldClose()) : (app.frames += 1) {
+        const at = zui_raylib.now(io);
+        const events = if (screenshot_mode) reader.eventsFor(at, screenshotSample(&ui, app)) else reader.read(at, .{});
+        ui.beginFrame(&.{ .params = zui_raylib.windowParams(at), .events = events }, &app.sources);
+        declare(&ui, app);
+        if (idle_measurement) |*measurement| {
+            if (measurement.reportAt(at, app)) |report| {
+                std.debug.print("{f}\n", .{report});
+                ui.release(ui.endFrame());
+                break;
+            }
+            ui.requestFrameAt(measurement.nextCheckpoint());
+        }
+        const frame = ui.endFrame();
 
         if (screenshot_mode) c.BeginTextureMode(offscreen) else c.BeginDrawing();
         c.ClearBackground(.{ .r = theme.background.r, .g = theme.background.g, .b = theme.background.b, .a = 255 });
-        zui_raylib.render(Ui.RenderCommand, &platform, frame.commands(), .{});
+        zui_raylib.render(Ui.RenderCommand, &text, frame.commands(), .{});
+        app.load();
         if (screenshot_mode) {
             c.EndTextureMode();
         } else {
-            // Sleep in EndDrawing until input or a task's wake, unless the
-            // frame just drawn may already be out of date.
-            if (ui.needsFrame()) c.DisableEventWaiting() else c.EnableEventWaiting();
+            host_requests.apply(frame.requests());
+            pacer.prepare(ui.nextFrame(&app.sources));
             c.EndDrawing();
         }
+        zui_tracy.frameMark();
+        ui.release(frame);
 
-        if (screenshot_mode and screenshotReady(&app, frame_number)) {
+        if (screenshot_mode and screenshotReady(app)) {
             var image = c.LoadImageFromTexture(offscreen.texture);
             defer c.UnloadImage(image);
             c.ImageFlipVertical(&image);
             if (!c.ExportImage(image, options.screenshot_path.?.ptr)) return error.ScreenshotFailed;
             std.debug.print("saved {s}\n", .{options.screenshot_path.?});
-            const stats = app.thumbnails.stats;
-            if (app.view == .thumbnails) std.debug.print("thumbnail loads: started {d}, completed {d}, canceled {d}\n", .{ stats.started, stats.completed, stats.canceled });
+            if (app.view == .thumbnails) std.debug.print("thumbnail loads: started {d}, completed {d}, canceled {d}; {d} wakes over {d} frames\n", .{
+                app.loader.started,
+                app.loader.completed.load(.monotonic),
+                app.loader.canceled.load(.monotonic),
+                app.wakes.load(.monotonic),
+                app.frames + 1,
+            });
             break;
         }
-        if (screenshot_mode and app.view == .thumbnails) init.io.sleep(.fromMilliseconds(10), .awake) catch {};
+        if (screenshot_mode and app.view == .thumbnails) io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
+}
+
+/// `--measure-idle`: the CPU time the demo uses while idle, read by the
+/// process itself at two frames it asks for with `requestFrameAt`, so the
+/// run ends on its own and needs no outside sampler.
+const IdleMeasurement = struct {
+    const warm_up_seconds = 5;
+    const measured_seconds = 10;
+
+    launched_at: zui.Instant,
+    start: ?Checkpoint = null,
+
+    const Checkpoint = struct { at: zui.Instant, cpu_nanoseconds: u64, frames: u64, wakes: u32 };
+
+    const Report = struct {
+        cpu_nanoseconds: u64,
+        seconds: f32,
+        frames: u64,
+        wakes: u32,
+
+        pub fn format(self: Report, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("idle: {d:.1} ms of CPU over {d:.1} s ({d:.3}% of one core), {d} frames, {d} wakes", .{
+                @as(f64, @floatFromInt(self.cpu_nanoseconds)) / std.time.ns_per_ms,
+                self.seconds,
+                @as(f64, @floatFromInt(self.cpu_nanoseconds)) / (self.seconds * std.time.ns_per_s) * 100,
+                self.frames,
+                self.wakes,
+            });
+        }
+    };
+
+    fn nextCheckpoint(self: *const IdleMeasurement) zui.Instant {
+        if (self.start) |start| return start.at.addSeconds(measured_seconds);
+        return self.launched_at.addSeconds(warm_up_seconds);
+    }
+
+    /// Called in every frame; the frame at the end of the measurement
+    /// counts toward it.
+    fn reportAt(self: *IdleMeasurement, at: zui.Instant, app: *const App) ?Report {
+        if (at.isBefore(self.nextCheckpoint())) return null;
+        const checkpoint: Checkpoint = .{ .at = at, .cpu_nanoseconds = processCpuNanoseconds(), .frames = app.frames, .wakes = app.wakes.load(.monotonic) };
+        const start = self.start orelse {
+            self.start = checkpoint;
+            return null;
+        };
+        return .{
+            .cpu_nanoseconds = checkpoint.cpu_nanoseconds - start.cpu_nanoseconds,
+            .seconds = checkpoint.at.secondsSince(start.at),
+            .frames = checkpoint.frames - start.frames,
+            .wakes = checkpoint.wakes - start.wakes,
+        };
+    }
+};
+
+extern "kernel32" fn GetProcessTimes(process: std.os.windows.HANDLE, creation: *std.os.windows.FILETIME, exit: *std.os.windows.FILETIME, kernel: *std.os.windows.FILETIME, user: *std.os.windows.FILETIME) callconv(.winapi) std.os.windows.BOOL;
+
+/// User and kernel time of every thread of this process.
+fn processCpuNanoseconds() u64 {
+    if (@import("builtin").os.tag == .windows) {
+        var creation: std.os.windows.FILETIME = undefined;
+        var exit: std.os.windows.FILETIME = undefined;
+        var kernel: std.os.windows.FILETIME = undefined;
+        var user: std.os.windows.FILETIME = undefined;
+        if (GetProcessTimes(std.os.windows.GetCurrentProcess(), &creation, &exit, &kernel, &user) == .FALSE) return 0;
+        const hundred_nanoseconds = fileTimeTicks(kernel) + fileTimeTicks(user);
+        return hundred_nanoseconds * 100;
+    }
+    const usage = std.posix.getrusage(std.posix.rusage.SELF);
+    return timevalNanoseconds(usage.utime) + timevalNanoseconds(usage.stime);
+}
+
+fn fileTimeTicks(time: std.os.windows.FILETIME) u64 {
+    return @as(u64, time.dwHighDateTime) << 32 | time.dwLowDateTime;
+}
+
+fn timevalNanoseconds(time: anytype) u64 {
+    return @as(u64, @intCast(time.sec)) * std.time.ns_per_s + @as(u64, @intCast(time.usec)) * std.time.ns_per_us;
 }
 
 fn centerOf(rect: zui.Rect) [2]f32 {
     return .{ rect.x + rect.width / 2, rect.y + rect.height / 2 };
 }
 
+/// The input a screenshot is taken with, known from the previous frame's
+/// layout.
+fn screenshotSample(ui: *const Ui, app: *const App) zui.InputSampler.Sample {
+    var sample: zui.InputSampler.Sample = .{};
+    switch (app.view) {
+        // Rest the pointer on "Hover me" so the screenshot shows hover
+        // state and the tooltip.
+        .documents => sample.pointer = if (ui.rectOf(ids.hover_me)) |rect| centerOf(rect) else null,
+        // Scroll far down once loads are underway, so the rows that leave
+        // the screen go unread and their loads are abandoned.
+        .thumbnails => {
+            sample.pointer = if (ui.rectOf(ids.grid)) |rect| centerOf(rect) else null;
+            if (app.frames == 5) sample.wheel = .{ 0, 3000 };
+        },
+        // Click the color scheme dropdown open, then rest the pointer on its
+        // last option so it shows hover state.
+        .settings => {
+            const dropdown = ids.preferences.child("color_scheme");
+            const target = if (app.frames < 3) dropdown else dropdown.indexedChild("option", 2);
+            sample.pointer = if (ui.rectOf(target)) |rect| centerOf(rect) else null;
+            if (app.frames == 1) sample.buttons = .initOne(.primary);
+        },
+    }
+    return sample;
+}
+
 /// Documents: three frames (lay out, hover, show the tooltip). Thumbnails:
-/// once some loads have finished and others are still pending. Settings:
-/// once the dropdown is open with an option hovered.
-fn screenshotReady(app: *const App, frame_number: u32) bool {
+/// once some loads have finished and some scrolled-away ones were
+/// abandoned. Settings: once the dropdown is open with an option hovered.
+fn screenshotReady(app: *const App) bool {
     return switch (app.view) {
-        .documents => frame_number == 2,
-        .thumbnails => app.thumbnails.stats.completed >= 20 or frame_number > 600,
-        .settings => frame_number == 5,
+        .documents => app.frames == 2,
+        .thumbnails => (app.loader.completed.load(.monotonic) >= 20 and app.loader.canceled.load(.monotonic) >= 1) or app.frames > 600,
+        .settings => app.frames == 5,
     };
 }
