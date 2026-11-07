@@ -20,13 +20,18 @@ pub const Texture = c.Texture2D;
 /// raylib itself exposes no way to wake its event wait from another thread.
 extern fn glfwPostEmptyEvent() void;
 
-/// A `zui.Config` whose text is measured by `Text` and whose images are
-/// raylib textures; override any field:
+/// A `zui.Config` for `Renderer`: text measured by `Text`, images that are
+/// raylib textures, and exactly the commands `Renderer` draws. Override
+/// any other field:
 /// `zui.Context(zui_raylib.config(.{ .limits = .{ .max_elements = 8192 } }))`.
 pub fn config(overrides: zui.Config) zui.Config {
+    comptime zui.checkRenderer(Renderer);
     var result = overrides;
     result.Text = Text;
-    result.ImageHandle = Texture;
+    result.commands = .initEmpty();
+    result.ImageHandle = Renderer.ImageHandle;
+    result.CustomData = void;
+    result.MaterialHandle = void;
     return result;
 }
 
@@ -351,53 +356,44 @@ fn encodeCodepoint(codepoint: u21, destination: []u8) usize {
 // Rendering
 // =====================================================================
 
-/// Hooks for payloads raylib cannot draw on its own.
-pub fn RenderOptions(comptime Command: type) type {
-    const Payload = @FieldType(Command, "payload");
-    return struct {
-        /// Required when `Config.CustomData` is not void.
-        draw_custom: ?*const fn (data: @FieldType(Payload, "custom"), bounds: zui.Rect) void = null,
-        /// Required when `Config.ImageHandle` is not `zui_raylib.Texture`.
-        draw_image: ?*const fn (handle: @FieldType(@FieldType(Payload, "image"), "handle"), bounds: zui.Rect) void = null,
-        /// Segments per rounded corner; raylib picks automatically at 0.
-        corner_segments: c_int = 0,
-    };
-}
-
-/// Draws one frame's commands. Call between `BeginDrawing` (or
-/// `BeginTextureMode`) and `EndDrawing`.
+/// The renderer contract, through raylib. It draws into raylib's current
+/// target: the window between `BeginDrawing` and `EndDrawing`, or a render
+/// texture between `BeginTextureMode` and `EndTextureMode`. raylib owns
+/// that window, so its surface is `.library`.
 ///
 /// ```zig
+/// var renderer: zui_raylib.Renderer = .{ .text = &text };
 /// const frame = ui.endFrame();
 /// c.BeginDrawing();
 /// c.ClearBackground(.{ .r = 30, .g = 30, .b = 36, .a = 255 });
-/// zui_raylib.render(Ui.RenderCommand, &text, frame.commands(), .{});
+/// try renderer.zuiSubmit(.library, frame);
 /// c.EndDrawing();
 /// ui.release(frame);
 /// ```
-pub fn render(comptime Command: type, text: *const Text, commands: []const Command, options: RenderOptions(Command)) void {
-    const Payload = @FieldType(Command, "payload");
-    const ImageHandle = @FieldType(@FieldType(Payload, "image"), "handle");
-    var scissors: ScissorStack = .{};
-    for (commands) |command| {
-        const bounds = command.bounds;
-        switch (command.payload) {
-            .rectangle => |rectangle| drawRectangle(bounds, rectangle.color, rectangle.corner_radius, options.corner_segments),
-            .border => |border| drawBorder(bounds, border.color, border.widths, border.corner_radius, options.corner_segments),
-            .text => |line| drawText(text, line.content, bounds, line.style.font, line.style.size, line.style.letter_spacing, line.style.color),
-            .image => |image| {
-                if (ImageHandle == Texture) {
-                    drawTexture(image.handle, bounds);
-                } else if (options.draw_image) |draw_image| {
-                    draw_image(image.handle, bounds);
-                }
-            },
-            .custom => |data| if (options.draw_custom) |draw_custom| draw_custom(data, bounds),
-            .clip_begin => |clip| scissors.push(clip),
-            .clip_end => scissors.pop(),
+pub const Renderer = struct {
+    pub const zui_surfaces: zui.SurfaceKinds = .initOne(.library);
+    pub const ImageHandle = Texture;
+
+    text: *const Text,
+    /// Segments per rounded corner; raylib picks automatically at 0.
+    corner_segments: c_int = 0,
+
+    pub fn zuiSubmit(self: *Renderer, surface: zui.Surface, frame: anytype) error{UnsupportedSurface}!void {
+        if (surface != .library) return error.UnsupportedSurface;
+        var scissors: ScissorStack = .{};
+        for (frame.commands()) |command| {
+            const bounds = command.bounds;
+            switch (command.payload) {
+                .rectangle => |rectangle| drawRectangle(bounds, rectangle.color, rectangle.corner_radius, self.corner_segments),
+                .border => |border| drawBorder(bounds, border.color, border.widths, border.corner_radius, self.corner_segments),
+                .text => |line| drawText(self.text, line.content, bounds, line.style.font, line.style.size, line.style.letter_spacing, line.style.color),
+                .image => |image| drawTexture(image.handle, bounds),
+                .clip_begin => |clip| scissors.push(clip),
+                .clip_end => scissors.pop(),
+            }
         }
     }
-}
+};
 
 fn toRaylibRectangle(rect: zui.Rect) c.Rectangle {
     return .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = rect.height };
@@ -545,8 +541,22 @@ test "every cursor maps to one of raylib's" {
 }
 
 test "config makes text raylib's and images raylib textures" {
-    const derived = config(.{ .limits = .{ .max_elements = 128 } });
+    const derived = config(.{ .limits = .{ .max_elements = 128 }, .CustomData = u32 });
     try std.testing.expect(derived.ImageHandle == Texture);
     try std.testing.expect(derived.Text == Text);
+    try std.testing.expect(derived.CustomData == void);
     try std.testing.expectEqual(@as(u32, 128), derived.limits.max_elements);
+}
+
+test "the renderer draws exactly the base commands and images, into raylib's own window" {
+    const Ui = zui.Context(config(.{ .limits = .{ .max_elements = 8 } }));
+    try std.testing.expectEqual(6, @typeInfo(Ui.RenderCommand.Payload).@"union".fields.len);
+    var text: Text = .{};
+    var ui = try Ui.init(std.testing.allocator, std.testing.io, &text);
+    defer ui.deinit(std.testing.allocator);
+    ui.beginFrame(&.{ .params = .{ .now = .zero, .viewport = .{ 100, 100 } } });
+    const frame = ui.endFrame();
+    defer ui.release(frame);
+    var renderer: Renderer = .{ .text = &text };
+    try std.testing.expectError(error.UnsupportedSurface, renderer.zuiSubmit(.{ .offscreen = .{ .size = .{ 100, 100 } } }, frame));
 }

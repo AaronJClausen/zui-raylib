@@ -3,8 +3,8 @@
 A [raylib](https://www.raylib.com) backend for
 [zui](https://github.com/AaronJClausen/zui): it turns raylib's input into
 zui's frame records, measures text with raylib fonts through zui's text
-contract, draws zui's render commands, and sleeps until zui's next frame
-is due. It also contains zui's reference application.
+contract, draws zui's frames as a renderer (zui's renderer contract), and
+sleeps until zui's next frame is due. It also contains zui's reference application.
 
 ![The demo application](docs/demo.png)
 
@@ -113,6 +113,7 @@ const Ui = zui.Context(zui_raylib.config(.{ .Sources = AppSources }));
 
 var text: zui_raylib.Text = .{}; // or .{ .fonts = &my_fonts }
 var ui = try Ui.init(gpa, io, &text);
+var renderer: zui_raylib.Renderer = .{ .text = &text };
 var input: zui_raylib.InputReader = .{};
 var pacer: zui_raylib.FramePacer = .{ .io = io };
 defer pacer.deinit();
@@ -125,7 +126,7 @@ while (!c.WindowShouldClose()) {
     const frame = ui.endFrame();
     c.BeginDrawing();
     c.ClearBackground(.{ .r = 22, .g = 22, .b = 28, .a = 255 });
-    zui_raylib.render(Ui.RenderCommand, &text, frame.commands(), .{});
+    try renderer.zuiSubmit(.library, frame);
     host_requests.apply(frame.requests());
     app.load(&ui); // the loader: start what the frame asked for
     pacer.prepare(ui.nextFrame(&app.sources));
@@ -134,10 +135,14 @@ while (!c.WindowShouldClose()) {
 }
 ```
 
-`zui_raylib.config(...)` sets `Text` to `zui_raylib.Text` and
-`ImageHandle` to raylib's `Texture2D`, so `ui.image(.{ .handle = texture },
-...)` draws directly. Other payload types can be drawn with the
-`draw_image` and `draw_custom` hooks in `RenderOptions`.
+`zui_raylib.Renderer` implements zui's renderer contract. Its surface is
+`.library`: raylib's own window between `BeginDrawing` and `EndDrawing`,
+or a render texture between `BeginTextureMode` and `EndTextureMode`.
+`zui_raylib.config(...)` builds the `Config` from its declarations: `Text`
+is `zui_raylib.Text`, `ImageHandle` is raylib's `Texture2D`, so
+`ui.image(.{ .handle = texture }, ...)` draws directly, and there are no
+optional commands and no `CustomData`. The renderer's `switch` over the
+commands therefore names exactly the base commands and `image`.
 
 `FramePacer` makes `EndDrawing` wait for events when `nextFrame` is
 `.on_event`, not wait when it is `.immediately`, and for `.at` arms a

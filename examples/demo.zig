@@ -459,6 +459,7 @@ pub fn main(init: std.process.Init) !void {
 
     var text: zui_raylib.Text = .{};
     var ui = try Ui.init(init.gpa, io, &text);
+    var renderer: zui_raylib.Renderer = .{ .text = &text };
     defer ui.deinit(init.gpa);
 
     const app = try init.gpa.create(App);
@@ -498,7 +499,7 @@ pub fn main(init: std.process.Init) !void {
 
         if (screenshot_mode) c.BeginTextureMode(offscreen) else c.BeginDrawing();
         c.ClearBackground(.{ .r = theme.background.r, .g = theme.background.g, .b = theme.background.b, .a = 255 });
-        zui_raylib.render(Ui.RenderCommand, &text, frame.commands(), .{});
+        try renderer.zuiSubmit(.library, frame);
         app.load();
         if (screenshot_mode) {
             c.EndTextureMode();
