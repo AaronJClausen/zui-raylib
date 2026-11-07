@@ -79,6 +79,15 @@ test `100 loads finishing between two frames cause one wake` in
 `examples/thumbnails.zig` asks for 100 thumbnails in one frame, finishes
 them on 100 tasks, and counts the wakes.
 
+## Conformance
+
+`zig build conformance` runs zui's renderer suite
+(`zui_testing.expectRendererConforms`) against the renderer, in a hidden
+window: `src/conformance.zig` draws each frame into a render texture and
+reads it back with `LoadImageFromTexture`, so the suite checks every clip
+and fill by its pixels. It needs a display, so `zig build test` leaves it
+out; CI runs it on Linux under `xvfb-run`, and it passes on Windows.
+
 ## Developing against a local zui
 
 `build.zig.zon` pins zui to a commit. To build against a zui working copy

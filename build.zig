@@ -40,6 +40,18 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(thumbnail_tests).step);
 
+    // Needs a display, which `test` does not: on Linux CI it runs under Xvfb.
+    const conformance_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/conformance.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zui_raylib", .module = backend_module },
+            .{ .name = "zui_testing", .module = zui_testing_module },
+        },
+    }) });
+    b.step("conformance", "Run zui's renderer suite against the renderer, in a hidden window").dependOn(&b.addRunArtifact(conformance_tests).step);
+
     const demo = b.addExecutable(.{
         .name = "zui-demo",
         .root_module = b.createModule(.{
@@ -61,7 +73,9 @@ pub fn build(b: *std.Build) void {
     if (b.args) |arguments| run_demo.addArgs(arguments);
     b.step("demo", "Run the demo application (`-- --screenshot demo.png` renders offscreen and exits)").dependOn(&run_demo.step);
 
-    b.step("check", "Compile the backend and the demo without producing output").dependOn(&demo.step);
+    const check_step = b.step("check", "Compile the backend, the demo and the renderer suite without producing output");
+    check_step.dependOn(&demo.step);
+    check_step.dependOn(&conformance_tests.step);
 
     const formatted_paths: []const []const u8 = &.{ "build.zig", "build.zig.zon", "src", "examples" };
     b.step("fmt", "Format all Zig sources").dependOn(&b.addFmt(.{ .paths = formatted_paths }).step);
