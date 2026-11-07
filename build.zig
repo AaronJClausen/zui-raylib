@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zui", .module = zui_module },
+            .{ .name = "zui_app", .module = zui_dependency.module("zui_app") },
             .{ .name = "zui_widgets", .module = zui_dependency.module("zui_widgets") },
             .{ .name = "zui_reflect", .module = zui_dependency.module("zui_reflect") },
             .{ .name = "zui_async", .module = zui_async_module },
@@ -50,7 +51,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zui_testing", .module = zui_testing_module },
         },
     }) });
-    b.step("conformance", "Run zui's renderer suite against the renderer, in a hidden window").dependOn(&b.addRunArtifact(conformance_tests).step);
+    b.step("conformance", "Run zui's renderer and host suites against the renderer and the host, in hidden windows").dependOn(&b.addRunArtifact(conformance_tests).step);
 
     const demo = b.addExecutable(.{
         .name = "zui-demo",

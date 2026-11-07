@@ -8,11 +8,13 @@
 //! zig build demo -- --screenshot settings.png --settings # ...in the generated settings editor
 //! zig build demo -- --hidden                            # run interactively in a hidden window
 //! zig build demo -- --measure-idle [--thumbnails]       # report the CPU time used over 10 idle seconds
+//! zig build demo -- --measure-startup                   # report the time from process start to the first presented frame
 //! ```
 
 const std = @import("std");
 const zui_raylib = @import("zui_raylib");
 const zui = zui_raylib.zui;
+const zui_app = zui_raylib.zui_app;
 const zui_widgets = zui_raylib.zui_widgets;
 const zui_reflect = zui_raylib.zui_reflect;
 const zui_tracy = zui_raylib.zui_tracy;
@@ -23,7 +25,7 @@ const AppSources = struct {
     thumbnails: thumbnails.Loads = .{},
 };
 
-const Ui = zui.Context(zui_raylib.config(.{
+const Ui = zui.Context(zui_app.contextConfig(zui_raylib.Renderer, .{
     .Sources = AppSources,
     .features = .{ .Tracer = zui_tracy.Tracer },
 }));
@@ -102,6 +104,11 @@ const thumbnail_pitch = thumbnail_size + thumbnail_gap;
 const thumbnail_rows = (thumbnails.count + thumbnail_columns - 1) / thumbnail_columns;
 
 const App = struct {
+    pub const Host = zui_raylib.Host;
+    pub const Renderer = zui_raylib.Renderer;
+
+    options: Options,
+    host: *Host,
     view: enum { documents, thumbnails, settings } = .documents,
     clicks: u32 = 0,
     last_action: []const u8 = "nothing yet",
@@ -115,6 +122,54 @@ const App = struct {
     frames: u64 = 0,
     /// Producers' wakes of the window's event wait.
     wakes: std.atomic.Value(u32) = .init(0),
+    idle_measurement: ?IdleMeasurement = null,
+
+    pub fn init(app: *App, start: zui_app.Start(App)) !void {
+        const process = start.process orelse return error.NoProcessArguments;
+        const options = try parseOptions(try process.minimal.args.toSlice(process.arena.allocator()));
+        app.* = .{
+            .options = options,
+            .host = start.host,
+            .loader = .{ .io = start.io },
+            .about_open = options.about_open,
+            .view = if (options.thumbnails) .thumbnails else if (options.settings) .settings else .documents,
+            .idle_measurement = if (options.measure_idle) .{ .launched_at = start.host.now() } else null,
+        };
+        app.initPreferences();
+        start.host.clear_color = theme.background;
+        if (options.screenshot_path != null) start.host.drawOffscreen();
+    }
+
+    /// Cancels the loads still running, so the sources outlive them.
+    pub fn deinit(app: *App) void {
+        app.loader.deinit();
+    }
+
+    pub fn zuiDeclare(app: *App, ui: *Ui) void {
+        declare(ui, app);
+        if (app.options.screenshot_path != null or app.options.measure_startup) ui.requestFrame();
+        if (app.options.measure_startup and app.frames == 1) {
+            reportStartup(app.host);
+            app.host.close();
+        }
+        if (app.idle_measurement) |*measurement| {
+            if (measurement.reportAt(ui.now(), app)) |report| {
+                std.debug.print("{f}\n", .{report});
+                app.host.close();
+            } else {
+                ui.requestFrameAt(measurement.nextCheckpoint());
+            }
+        }
+    }
+
+    /// After each frame: starts the loads it asked for, and takes the
+    /// screenshot once the frame shows what it should.
+    pub fn zuiLoader(app: *App, ui: *const Ui, _: std.Io) void {
+        app.loader.startWanted(&app.sources.thumbnails, app.waker());
+        zui_tracy.frameMark();
+        if (app.options.screenshot_path) |path| app.capture(ui, path);
+        app.frames += 1;
+    }
 
     fn initPreferences(app: *App) void {
         app.preferences = .{ .display_name = .init(&app.display_name_bytes, "Ada") };
@@ -127,12 +182,27 @@ const App = struct {
     fn countWake(context: *anyopaque) void {
         const app: *App = @ptrCast(@alignCast(context));
         _ = app.wakes.fetchAdd(1, .monotonic);
-        zui_raylib.wake();
+        app.host.zuiWaker().wake();
     }
 
-    /// The loader: after `endFrame`, starts the loads the frame asked for.
-    fn load(app: *App) void {
-        app.loader.startWanted(&app.sources.thumbnails, app.waker());
+    fn capture(app: *App, ui: *const Ui, path: [:0]const u8) void {
+        if (!screenshotReady(app)) {
+            app.host.script(screenshotSample(ui, app.view, app.frames + 1)) catch {};
+            return;
+        }
+        app.host.saveScreenshot(path) catch |err| {
+            std.debug.print("could not save {s}: {t}\n", .{ path, err });
+            std.process.exit(1);
+        };
+        std.debug.print("saved {s}\n", .{path});
+        if (app.view == .thumbnails) std.debug.print("thumbnail loads: started {d}, completed {d}, canceled {d}; {d} wakes over {d} frames\n", .{
+            app.loader.started,
+            app.loader.completed.load(.monotonic),
+            app.loader.canceled.load(.monotonic),
+            app.wakes.load(.monotonic),
+            app.frames + 1,
+        });
+        app.host.close();
     }
 };
 
@@ -417,6 +487,7 @@ const Options = struct {
     settings: bool = false,
     hidden: bool = false,
     measure_idle: bool = false,
+    measure_startup: bool = false,
 };
 
 fn parseOptions(arguments: []const [:0]const u8) !Options {
@@ -428,6 +499,7 @@ fn parseOptions(arguments: []const [:0]const u8) !Options {
             index += 1;
             if (index == arguments.len) return error.MissingScreenshotPath;
             options.screenshot_path = arguments[index];
+            options.hidden = true;
         } else if (std.mem.eql(u8, argument, "--about")) {
             options.about_open = true;
         } else if (std.mem.eql(u8, argument, "--thumbnails")) {
@@ -439,8 +511,11 @@ fn parseOptions(arguments: []const [:0]const u8) !Options {
         } else if (std.mem.eql(u8, argument, "--measure-idle")) {
             options.hidden = true;
             options.measure_idle = true;
+        } else if (std.mem.eql(u8, argument, "--measure-startup")) {
+            options.hidden = true;
+            options.measure_startup = true;
         } else {
-            std.debug.print("unknown argument \"{s}\"; expected --screenshot <path>, --about, --thumbnails, --settings, --hidden or --measure-idle\n", .{argument});
+            std.debug.print("unknown argument \"{s}\"; expected --screenshot <path>, --about, --thumbnails, --settings, --hidden, --measure-idle or --measure-startup\n", .{argument});
             return error.UnknownArgument;
         }
     }
@@ -448,86 +523,8 @@ fn parseOptions(arguments: []const [:0]const u8) !Options {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const io = init.io;
     const options = try parseOptions(try init.minimal.args.toSlice(init.arena.allocator()));
-    const screenshot_mode = options.screenshot_path != null;
-
-    c.SetConfigFlags(if (screenshot_mode or options.hidden) c.FLAG_WINDOW_HIDDEN else c.FLAG_WINDOW_RESIZABLE | c.FLAG_MSAA_4X_HINT);
-    c.InitWindow(1100, 700, "zui + raylib");
-    defer c.CloseWindow();
-    c.SetTargetFPS(60);
-
-    var text: zui_raylib.Text = .{};
-    var ui = try Ui.init(init.gpa, io, &text);
-    var renderer: zui_raylib.Renderer = .{ .text = &text };
-    defer ui.deinit(init.gpa);
-
-    const app = try init.gpa.create(App);
-    defer init.gpa.destroy(app);
-    app.* = .{
-        .loader = .{ .io = io },
-        .about_open = options.about_open,
-        .view = if (options.thumbnails) .thumbnails else if (options.settings) .settings else .documents,
-    };
-    app.initPreferences();
-    defer app.loader.deinit();
-
-    var reader: zui_raylib.InputReader = .{};
-    var pacer: zui_raylib.FramePacer = .{ .io = io };
-    defer pacer.deinit();
-    var host_requests: zui_raylib.HostRequestApplier = .{};
-
-    const offscreen = if (screenshot_mode) c.LoadRenderTexture(c.GetScreenWidth(), c.GetScreenHeight()) else undefined;
-    defer if (screenshot_mode) c.UnloadRenderTexture(offscreen);
-
-    var idle_measurement: ?IdleMeasurement = if (options.measure_idle) .{ .launched_at = zui_raylib.now(io) } else null;
-
-    while (!c.WindowShouldClose()) : (app.frames += 1) {
-        const at = zui_raylib.now(io);
-        const events = if (screenshot_mode) reader.eventsFor(at, screenshotSample(&ui, app)) else reader.read(at, .{});
-        ui.beginFrame(&.{ .params = zui_raylib.windowParams(at), .events = events }, &app.sources);
-        declare(&ui, app);
-        if (idle_measurement) |*measurement| {
-            if (measurement.reportAt(at, app)) |report| {
-                std.debug.print("{f}\n", .{report});
-                ui.release(ui.endFrame());
-                break;
-            }
-            ui.requestFrameAt(measurement.nextCheckpoint());
-        }
-        const frame = ui.endFrame();
-
-        if (screenshot_mode) c.BeginTextureMode(offscreen) else c.BeginDrawing();
-        c.ClearBackground(.{ .r = theme.background.r, .g = theme.background.g, .b = theme.background.b, .a = 255 });
-        try renderer.zuiSubmit(.library, frame);
-        app.load();
-        if (screenshot_mode) {
-            c.EndTextureMode();
-        } else {
-            host_requests.apply(frame.requests());
-            pacer.prepare(ui.nextFrame(&app.sources));
-            c.EndDrawing();
-        }
-        zui_tracy.frameMark();
-        ui.release(frame);
-
-        if (screenshot_mode and screenshotReady(app)) {
-            var image = c.LoadImageFromTexture(offscreen.texture);
-            defer c.UnloadImage(image);
-            c.ImageFlipVertical(&image);
-            if (!c.ExportImage(image, options.screenshot_path.?.ptr)) return error.ScreenshotFailed;
-            std.debug.print("saved {s}\n", .{options.screenshot_path.?});
-            if (app.view == .thumbnails) std.debug.print("thumbnail loads: started {d}, completed {d}, canceled {d}; {d} wakes over {d} frames\n", .{
-                app.loader.started,
-                app.loader.completed.load(.monotonic),
-                app.loader.canceled.load(.monotonic),
-                app.wakes.load(.monotonic),
-                app.frames + 1,
-            });
-            break;
-        }
-        if (screenshot_mode and app.view == .thumbnails) io.sleep(.fromMilliseconds(10), .awake) catch {};
-    }
+    try zui_app.run(App, init, .{ .title = "zui + raylib", .size = .{ 1100, 700 }, .visible = !options.hidden, .resizable = !options.hidden });
 }
 
 /// `--measure-idle`: the CPU time the demo uses while idle, read by the
@@ -582,24 +579,49 @@ const IdleMeasurement = struct {
     }
 };
 
-extern "kernel32" fn GetProcessTimes(process: std.os.windows.HANDLE, creation: *std.os.windows.FILETIME, exit: *std.os.windows.FILETIME, kernel: *std.os.windows.FILETIME, user: *std.os.windows.FILETIME) callconv(.winapi) std.os.windows.BOOL;
+const windows = std.os.windows;
+extern "kernel32" fn GetProcessTimes(process: windows.HANDLE, creation: *windows.FILETIME, exit: *windows.FILETIME, kernel: *windows.FILETIME, user: *windows.FILETIME) callconv(.winapi) windows.BOOL;
+extern "kernel32" fn GetSystemTimePreciseAsFileTime(time: *windows.FILETIME) callconv(.winapi) void;
+
+/// In 100-nanosecond ticks; creation since 1601, the others in total.
+const ProcessTimes = struct { creation: u64, kernel: u64, user: u64 };
+
+fn processTimes() ProcessTimes {
+    var times: [4]windows.FILETIME = undefined;
+    if (GetProcessTimes(windows.GetCurrentProcess(), &times[0], &times[1], &times[2], &times[3]) == .FALSE) return .{ .creation = 0, .kernel = 0, .user = 0 };
+    return .{ .creation = fileTimeTicks(times[0]), .kernel = fileTimeTicks(times[2]), .user = fileTimeTicks(times[3]) };
+}
 
 /// User and kernel time of every thread of this process.
 fn processCpuNanoseconds() u64 {
     if (@import("builtin").os.tag == .windows) {
-        var creation: std.os.windows.FILETIME = undefined;
-        var exit: std.os.windows.FILETIME = undefined;
-        var kernel: std.os.windows.FILETIME = undefined;
-        var user: std.os.windows.FILETIME = undefined;
-        if (GetProcessTimes(std.os.windows.GetCurrentProcess(), &creation, &exit, &kernel, &user) == .FALSE) return 0;
-        const hundred_nanoseconds = fileTimeTicks(kernel) + fileTimeTicks(user);
-        return hundred_nanoseconds * 100;
+        const times = processTimes();
+        return (times.kernel + times.user) * 100;
     }
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     return timevalNanoseconds(usage.utime) + timevalNanoseconds(usage.stime);
 }
 
-fn fileTimeTicks(time: std.os.windows.FILETIME) u64 {
+/// `--measure-startup`: from the moment the OS created the process to the
+/// moment the first frame was presented, read in the second frame.
+fn reportStartup(host: *const App.Host) void {
+    const presented = host.first_present orelse return std.debug.print("startup: no frame was presented\n", .{});
+    if (@import("builtin").os.tag != .windows) return std.debug.print("startup: not measured on this system\n", .{});
+    var wall_now: windows.FILETIME = undefined;
+    GetSystemTimePreciseAsFileTime(&wall_now);
+    const since_creation_ns = (fileTimeTicks(wall_now) - processTimes().creation) * 100;
+    const created = host.now().nanoseconds -| since_creation_ns;
+    std.debug.print("startup: first frame presented {d:.1} ms after the process was created; the window was open at {d:.1} ms\n", .{
+        milliseconds(presented.nanoseconds -| created),
+        milliseconds(host.opened_at.nanoseconds -| created),
+    });
+}
+
+fn milliseconds(nanoseconds: u64) f64 {
+    return @as(f64, @floatFromInt(nanoseconds)) / std.time.ns_per_ms;
+}
+
+fn fileTimeTicks(time: windows.FILETIME) u64 {
     return @as(u64, time.dwHighDateTime) << 32 | time.dwLowDateTime;
 }
 
@@ -611,11 +633,11 @@ fn centerOf(rect: zui.Rect) [2]f32 {
     return .{ rect.x + rect.width / 2, rect.y + rect.height / 2 };
 }
 
-/// The input a screenshot is taken with, known from the previous frame's
-/// layout.
-fn screenshotSample(ui: *const Ui, app: *const App) zui.InputSampler.Sample {
+/// The input frame `frame` of a screenshot is taken with, known from the
+/// layout of the frame before it.
+fn screenshotSample(ui: *const Ui, view: @FieldType(App, "view"), frame: u64) zui.InputSampler.Sample {
     var sample: zui.InputSampler.Sample = .{};
-    switch (app.view) {
+    switch (view) {
         // Rest the pointer on "Hover me" so the screenshot shows hover
         // state and the tooltip.
         .documents => sample.pointer = if (ui.rectOf(ids.hover_me)) |rect| centerOf(rect) else null,
@@ -623,15 +645,15 @@ fn screenshotSample(ui: *const Ui, app: *const App) zui.InputSampler.Sample {
         // the screen go unread and their loads are abandoned.
         .thumbnails => {
             sample.pointer = if (ui.rectOf(ids.grid)) |rect| centerOf(rect) else null;
-            if (app.frames == 5) sample.wheel = .{ 0, 3000 };
+            if (frame == 5) sample.wheel = .{ 0, 3000 };
         },
         // Click the color scheme dropdown open, then rest the pointer on its
         // last option so it shows hover state.
         .settings => {
             const dropdown = ids.preferences.child("color_scheme");
-            const target = if (app.frames < 3) dropdown else dropdown.indexedChild("option", 2);
+            const target = if (frame < 3) dropdown else dropdown.indexedChild("option", 2);
             sample.pointer = if (ui.rectOf(target)) |rect| centerOf(rect) else null;
-            if (app.frames == 1) sample.buttons = .initOne(.primary);
+            if (frame == 1) sample.buttons = .initOne(.primary);
         },
     }
     return sample;

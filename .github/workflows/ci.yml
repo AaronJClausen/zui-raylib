@@ -53,7 +53,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev xvfb
       - run: zig build test
       - run: zig build check
-      - name: Run zui's renderer suite
+      - name: Run zui's renderer and host suites
         run: xvfb-run --auto-servernum zig build conformance
       - name: Render the demo offscreen
         run: |

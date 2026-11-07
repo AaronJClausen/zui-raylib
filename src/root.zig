@@ -1,11 +1,11 @@
-//! zui-raylib: renders zui frames with raylib and turns raylib's input into
-//! frame records. See README.md for usage.
+//! zui-raylib: a zui renderer and adapter host on raylib. See README.md.
 
 const std = @import("std");
 
 /// The zui this backend is built against; import it from here so the
 /// application and the backend always agree on zui's types.
 pub const zui = @import("zui");
+pub const zui_app = @import("zui_app");
 pub const zui_widgets = @import("zui_widgets");
 pub const zui_reflect = @import("zui_reflect");
 pub const zui_async = @import("zui_async");
@@ -16,180 +16,315 @@ pub const c = @import("raylib");
 
 pub const Texture = c.Texture2D;
 
-/// Compiled into raylib with its desktop GLFW platform (the default);
-/// raylib itself exposes no way to wake its event wait from another thread.
-extern fn glfwPostEmptyEvent() void;
+/// GLFW, compiled into raylib with its desktop platform (the default).
+/// raylib can neither wake its event wait from another thread nor wait
+/// until an instant, so the host reaches past it.
+const glfw = struct {
+    const Window = opaque {};
+    extern fn glfwPostEmptyEvent() void;
+    extern fn glfwWaitEvents() void;
+    extern fn glfwWaitEventsTimeout(seconds: f64) void;
+    extern fn glfwGetCurrentContext() ?*Window;
+    extern fn glfwWindowShouldClose(window: ?*Window) c_int;
+    extern fn glfwSetWindowShouldClose(window: ?*Window, value: c_int) void;
+    extern fn glfwSetKeyCallback(window: ?*Window, callback: ?*const KeyCallback) ?*const KeyCallback;
+    extern fn glfwSetCharCallback(window: ?*Window, callback: ?*const CharCallback) ?*const CharCallback;
+    extern fn glfwSetMouseButtonCallback(window: ?*Window, callback: ?*const ButtonCallback) ?*const ButtonCallback;
+    extern fn glfwSetCursorPosCallback(window: ?*Window, callback: ?*const PositionCallback) ?*const PositionCallback;
+    extern fn glfwSetScrollCallback(window: ?*Window, callback: ?*const PositionCallback) ?*const PositionCallback;
+    extern fn glfwSetCursorEnterCallback(window: ?*Window, callback: ?*const FlagCallback) ?*const FlagCallback;
+    extern fn glfwSetWindowFocusCallback(window: ?*Window, callback: ?*const FlagCallback) ?*const FlagCallback;
+    extern fn glfwSetWindowSizeCallback(window: ?*Window, callback: ?*const SizeCallback) ?*const SizeCallback;
+    extern fn glfwSetWindowRefreshCallback(window: ?*Window, callback: ?*const WindowCallback) ?*const WindowCallback;
+    extern fn glfwSetWindowCloseCallback(window: ?*Window, callback: ?*const WindowCallback) ?*const WindowCallback;
 
-/// A `zui.Config` for `Renderer`: text measured by `Text`, images that are
-/// raylib textures, and exactly the commands `Renderer` draws. Override
-/// any other field:
-/// `zui.Context(zui_raylib.config(.{ .limits = .{ .max_elements = 8192 } }))`.
-pub fn config(overrides: zui.Config) zui.Config {
-    comptime zui.checkRenderer(Renderer);
-    var result = overrides;
-    result.Text = Text;
-    result.commands = .initEmpty();
-    result.ImageHandle = Renderer.ImageHandle;
-    result.CustomData = void;
-    result.MaterialHandle = void;
-    return result;
-}
-
-/// The text contract, through raylib fonts. `FontId` indexes `fonts`; with
-/// no fonts loaded, raylib's built-in font is used for every id.
-pub const Text = struct {
-    fonts: []const c.Font = &.{},
-    /// Space raylib's fonts need between glyphs, as a fraction of the size,
-    /// before the style's own letter spacing. raylib's `DrawText` uses 0.1.
-    font_spacing: f32 = 0.1,
-
-    /// Each glyph counts its advance plus the spacing after it, so that
-    /// measuring "a", " " and "b" separately adds up to measuring "a b",
-    /// which zui relies on when it wraps. raylib's `MeasureTextEx` leaves
-    /// out the spacing after the last glyph.
-    pub fn zuiMeasure(self: *Text, run: []const u8, key: zui.MeasureKey(u16)) [2]f32 {
-        const raylib_font = self.fontFor(key.font);
-        const glyph_spacing = self.spacing(key.size, key.letter_spacing);
-        var width: f32 = 0;
-        var height: f32 = key.size;
-        var chunks: CStringChunks = .init(run);
-        while (chunks.next()) |chunk| {
-            const measured = c.MeasureTextEx(raylib_font, chunk.ptr, key.size, glyph_spacing);
-            width += measured.x + glyph_spacing;
-            height = @max(height, measured.y);
-        }
-        return .{ width, height };
-    }
-
-    pub fn fontFor(self: *const Text, font: u16) c.Font {
-        return if (font < self.fonts.len) self.fonts[font] else c.GetFontDefault();
-    }
-
-    /// raylib's spacing between glyphs for text of `size` with the style's
-    /// `letter_spacing`.
-    pub fn spacing(self: *const Text, size: f32, letter_spacing: f32) f32 {
-        return size * self.font_spacing + letter_spacing;
-    }
+    const KeyCallback = fn (?*Window, c_int, c_int, c_int, c_int) callconv(.c) void;
+    const CharCallback = fn (?*Window, c_uint) callconv(.c) void;
+    const ButtonCallback = fn (?*Window, c_int, c_int, c_int) callconv(.c) void;
+    const PositionCallback = fn (?*Window, f64, f64) callconv(.c) void;
+    const FlagCallback = fn (?*Window, c_int) callconv(.c) void;
+    const SizeCallback = fn (?*Window, c_int, c_int) callconv(.c) void;
+    const WindowCallback = fn (?*Window) callconv(.c) void;
 };
 
-/// raylib takes NUL-terminated strings, and zui hands out slices into its
-/// frame buffer, so text is copied into this buffer one chunk at a time.
-const CStringChunks = struct {
-    const capacity = 1024;
+/// Set by every OS event that should end a wait, from GLFW callbacks put
+/// in front of raylib's own. GLFW's callbacks carry no context, and the
+/// host has one window, so this is global.
+const os_event = struct {
+    var arrived: bool = false;
+    var key: ?*const glfw.KeyCallback = null;
+    var char: ?*const glfw.CharCallback = null;
+    var button: ?*const glfw.ButtonCallback = null;
+    var cursor: ?*const glfw.PositionCallback = null;
+    var scroll: ?*const glfw.PositionCallback = null;
+    var enter: ?*const glfw.FlagCallback = null;
+    var focus: ?*const glfw.FlagCallback = null;
+    var size: ?*const glfw.SizeCallback = null;
+    var refresh: ?*const glfw.WindowCallback = null;
+    var close: ?*const glfw.WindowCallback = null;
 
-    remaining: []const u8,
-    buffer: [capacity + 1]u8 = undefined,
-
-    fn init(text: []const u8) CStringChunks {
-        return .{ .remaining = text };
+    fn install(window: ?*glfw.Window) void {
+        key = glfw.glfwSetKeyCallback(window, onKey);
+        char = glfw.glfwSetCharCallback(window, onChar);
+        button = glfw.glfwSetMouseButtonCallback(window, onButton);
+        cursor = glfw.glfwSetCursorPosCallback(window, onCursor);
+        scroll = glfw.glfwSetScrollCallback(window, onScroll);
+        enter = glfw.glfwSetCursorEnterCallback(window, onEnter);
+        focus = glfw.glfwSetWindowFocusCallback(window, onFocus);
+        size = glfw.glfwSetWindowSizeCallback(window, onSize);
+        refresh = glfw.glfwSetWindowRefreshCallback(window, onRefresh);
+        close = glfw.glfwSetWindowCloseCallback(window, onClose);
     }
 
-    /// The next chunk, split on a UTF-8 boundary so no code point is cut.
-    fn next(self: *CStringChunks) ?[:0]const u8 {
-        if (self.remaining.len == 0) return null;
-        var length = @min(self.remaining.len, capacity);
-        while (length < self.remaining.len and length > 0 and (self.remaining[length] & 0xC0) == 0x80) length -= 1;
-        if (length == 0) length = @min(self.remaining.len, capacity);
-        @memcpy(self.buffer[0..length], self.remaining[0..length]);
-        self.buffer[length] = 0;
-        self.remaining = self.remaining[length..];
-        return self.buffer[0..length :0];
+    fn onKey(window: ?*glfw.Window, key_code: c_int, scancode: c_int, action: c_int, modifiers: c_int) callconv(.c) void {
+        arrived = true;
+        if (key) |previous| previous(window, key_code, scancode, action, modifiers);
+    }
+    fn onChar(window: ?*glfw.Window, codepoint: c_uint) callconv(.c) void {
+        arrived = true;
+        if (char) |previous| previous(window, codepoint);
+    }
+    fn onButton(window: ?*glfw.Window, mouse_button: c_int, action: c_int, modifiers: c_int) callconv(.c) void {
+        arrived = true;
+        if (button) |previous| previous(window, mouse_button, action, modifiers);
+    }
+    fn onCursor(window: ?*glfw.Window, x: f64, y: f64) callconv(.c) void {
+        arrived = true;
+        if (cursor) |previous| previous(window, x, y);
+    }
+    fn onScroll(window: ?*glfw.Window, x: f64, y: f64) callconv(.c) void {
+        arrived = true;
+        if (scroll) |previous| previous(window, x, y);
+    }
+    fn onEnter(window: ?*glfw.Window, entered: c_int) callconv(.c) void {
+        arrived = true;
+        if (enter) |previous| previous(window, entered);
+    }
+    fn onFocus(window: ?*glfw.Window, focused: c_int) callconv(.c) void {
+        arrived = true;
+        if (focus) |previous| previous(window, focused);
+    }
+    fn onSize(window: ?*glfw.Window, width: c_int, height: c_int) callconv(.c) void {
+        arrived = true;
+        if (size) |previous| previous(window, width, height);
+    }
+    fn onRefresh(window: ?*glfw.Window) callconv(.c) void {
+        arrived = true;
+        if (refresh) |previous| previous(window);
+    }
+    fn onClose(window: ?*glfw.Window) callconv(.c) void {
+        arrived = true;
+        if (close) |previous| previous(window);
     }
 };
 
 // =====================================================================
-// The host side: input, waking, waiting and requests
+// The host: one window, its input, its waits and its requests
 // =====================================================================
 
-/// The host's monotonic clock, for frame records.
-pub fn now(io: std.Io) zui.Instant {
-    return .fromTimestamp(std.Io.Timestamp.now(io, .awake));
-}
-
-/// The viewport and scale of raylib's window, for frame records.
-pub fn windowParams(at: zui.Instant) zui.FrameParams {
-    const screen_width = c.GetScreenWidth();
-    return .{
-        .now = at,
-        .viewport = .{ @floatFromInt(screen_width), @floatFromInt(c.GetScreenHeight()) },
-        .scale = if (screen_width > 0) @as(f32, @floatFromInt(c.GetRenderWidth())) / @as(f32, @floatFromInt(screen_width)) else 1,
-    };
-}
-
-/// Ends raylib's event wait from any thread. GLFW documents
-/// `glfwPostEmptyEvent` as callable from any thread, and the empty event
-/// stays queued until the next wait, so the wake is sticky.
-pub fn wake() void {
-    glfwPostEmptyEvent();
-}
-
-/// A `zui.Waker` for sources' producers, calling `wake`.
-pub fn waker() zui.Waker {
-    return .{ .context = &waker_context, .wakeFn = wakeErased };
-}
-
-var waker_context: u8 = 0;
-
-fn wakeErased(_: *anyopaque) void {
-    wake();
-}
-
-/// Sleeps as `zui.NextFrame` says, inside raylib's `EndDrawing`, which waits
-/// for events after presenting when event waiting is on. A deadline is met
-/// by a timer that wakes the wait at that instant.
+/// zui's host contract on raylib's window, with one window and no system
+/// material. Input goes through `zui.InputSampler`, since raylib reports
+/// state; waits go through GLFW, so an idle window sleeps until input, a
+/// wake or the instant `nextFrame` names. Its surface is `.library`:
+/// `zuiPoll` begins raylib's drawing and `zuiWait` presents it.
 ///
 /// ```zig
-/// pacer.prepare(ui.nextFrame(&app.sources)); // after the loader
-/// c.EndDrawing();
+/// const App = struct {
+///     pub const Host = zui_raylib.Host;
+///     pub const Renderer = zui_raylib.Renderer;
+///     // ...
+/// };
 /// ```
-pub const FramePacer = struct {
+pub const Host = struct {
+    pub const zui_surfaces: zui.SurfaceKinds = .initOne(.library);
+    pub const zui_capabilities: zui.HostCapabilities = .{};
+
     io: std.Io,
-    timers: std.Io.Group = .init,
-    scheduled_deadline: ?zui.Instant = null,
-
-    /// Call after the loader and before `EndDrawing`, so a producer's wake
-    /// after `nextFrame` stays queued for the wait.
-    pub fn prepare(self: *FramePacer, next: zui.NextFrame) void {
-        switch (next) {
-            .immediately => c.DisableEventWaiting(),
-            .on_event => c.EnableEventWaiting(),
-            .at => |deadline| {
-                c.EnableEventWaiting();
-                if (self.scheduled_deadline) |scheduled| if (scheduled.nanoseconds == deadline.nanoseconds) return;
-                self.scheduled_deadline = deadline;
-                self.timers.concurrent(self.io, wakeAt, .{ self.io, deadline }) catch c.DisableEventWaiting();
-            },
-        }
-    }
-
-    /// Stops the timers. Call before closing the window.
-    pub fn deinit(self: *FramePacer) void {
-        self.timers.cancel(self.io);
-    }
-
-    /// A sleep may end a little early, and a frame woken before its
-    /// deadline would ask for the same instant again, which `prepare` does
-    /// not schedule twice, so this wakes only once the deadline has passed.
-    fn wakeAt(io: std.Io, deadline: zui.Instant) std.Io.Cancelable!void {
-        while (now(io).isBefore(deadline)) {
-            const remaining = deadline.nanoseconds -| now(io).nanoseconds;
-            try io.sleep(.fromNanoseconds(@intCast(remaining)), .awake);
-        }
-        wake();
-    }
-};
-
-/// Applies what a frame asks of the host that raylib can do: the cursor.
-/// raylib has no IME window to place.
-pub const HostRequestApplier = struct {
+    window: ?*glfw.Window,
+    input: InputOptions = .{},
+    /// What each frame is cleared to before the renderer draws.
+    clear_color: zui.Color = .black,
+    /// `.immediately` waits until this long after the last frame began:
+    /// the monitor's refresh interval.
+    frame_interval_ns: u64,
+    reader: InputReader = .{},
+    scripted: [scripted_capacity]zui.InputSampler.Sample = undefined,
+    scripted_first: usize = 0,
+    scripted_count: usize = 0,
+    woken: std.atomic.Value(bool) = .init(false),
+    drawing: bool = false,
+    closed: bool = false,
+    offscreen: ?c.RenderTexture2D = null,
     applied_cursor: ?zui.Cursor = null,
+    frame_began: zui.Instant = .zero,
+    /// When `init` had opened the window, and when the first frame was
+    /// presented: what an application's cold start is made of.
+    opened_at: zui.Instant = .zero,
+    first_present: ?zui.Instant = null,
 
-    pub fn apply(self: *HostRequestApplier, requests: zui.HostRequests) void {
+    const scripted_capacity = 16;
+
+    pub fn init(self: *Host, io: std.Io, window: zui.WindowOptions) !void {
+        var flags: c_uint = c.FLAG_MSAA_4X_HINT;
+        if (!window.visible) flags |= c.FLAG_WINDOW_HIDDEN;
+        if (window.resizable) flags |= c.FLAG_WINDOW_RESIZABLE;
+        c.SetTraceLogLevel(c.LOG_WARNING);
+        c.SetConfigFlags(flags);
+        c.InitWindow(@intCast(window.size[0]), @intCast(window.size[1]), window.title.ptr);
+        if (!c.IsWindowReady()) return error.WindowUnavailable;
+        // Escape belongs to the application, not to closing the window.
+        c.SetExitKey(c.KEY_NULL);
+        const refresh_rate = c.GetMonitorRefreshRate(c.GetCurrentMonitor());
+        self.* = .{
+            .io = io,
+            .window = glfw.glfwGetCurrentContext(),
+            .frame_interval_ns = std.time.ns_per_s / @as(u64, @intCast(if (refresh_rate > 0) refresh_rate else 60)),
+            .opened_at = .fromTimestamp(std.Io.Timestamp.now(io, .awake)),
+        };
+        os_event.install(self.window);
+    }
+
+    pub fn deinit(self: *Host) void {
+        if (self.offscreen) |texture| c.UnloadRenderTexture(texture);
+        c.CloseWindow();
+        self.* = undefined;
+    }
+
+    /// Draws every frame into a texture of the window's size instead of
+    /// the window, for `saveScreenshot`.
+    pub fn drawOffscreen(self: *Host) void {
+        if (self.offscreen == null) self.offscreen = c.LoadRenderTexture(c.GetScreenWidth(), c.GetScreenHeight());
+    }
+
+    /// Saves the frame drawn offscreen as an image file, such as a PNG.
+    /// Call it once the frame was submitted, as from the loader.
+    pub fn saveScreenshot(self: *Host, path: [:0]const u8) !void {
+        const texture = self.offscreen orelse return error.NotDrawingOffscreen;
+        self.endDrawing();
+        var image = c.LoadImageFromTexture(texture.texture);
+        defer c.UnloadImage(image);
+        c.ImageFlipVertical(&image);
+        if (!c.ExportImage(image, path.ptr)) return error.ScreenshotFailed;
+    }
+
+    /// Input for a later poll instead of raylib's, one sample a poll, as a
+    /// test or a scripted capture wants. Its slices must stay valid until
+    /// that poll.
+    pub fn script(self: *Host, sample: zui.InputSampler.Sample) error{Full}!void {
+        if (self.scripted_count == scripted_capacity) return error.Full;
+        self.scripted[(self.scripted_first + self.scripted_count) % scripted_capacity] = sample;
+        self.scripted_count += 1;
+    }
+
+    /// Closes the window as its close button would: the next poll is false.
+    pub fn close(self: *Host) void {
+        glfw.glfwSetWindowShouldClose(self.window, 1);
+        glfw.glfwPostEmptyEvent();
+    }
+
+    pub fn zuiPoll(self: *Host, window: zui.WindowId, record: *zui.RecordBuilder) bool {
+        std.debug.assert(window == .main);
+        // raylib's own flag lasts one frame, GLFW's until raylib polls.
+        if (self.closed or c.WindowShouldClose() or glfw.glfwWindowShouldClose(self.window) != 0) {
+            self.closed = true;
+            return false;
+        }
+        const at = self.now();
+        self.frame_began = at;
+        record.begin(.{ .now = at, .viewport = .{ @floatFromInt(c.GetScreenWidth()), @floatFromInt(c.GetScreenHeight()) }, .scale = renderScale() });
+        const sample = self.nextScripted() orelse self.reader.sample(self.input);
+        for (self.reader.eventsFor(at, sample)) |event| switch (event) {
+            .text => |text| record.appendText(text),
+            else => record.append(event),
+        };
+        os_event.arrived = false;
+
+        if (self.offscreen) |texture| c.BeginTextureMode(texture) else c.BeginDrawing();
+        c.ClearBackground(toRaylibColor(self.clear_color));
+        self.drawing = true;
+        return true;
+    }
+
+    pub fn zuiWaker(self: *Host) zui.Waker {
+        return .{ .context = self, .wakeFn = wake };
+    }
+
+    /// Presents the frame, then sleeps until input arrives, the host is
+    /// woken, or the instant `next` names. The wake flag is cleared after
+    /// the wait, never before, so a wake that came first ends it at once.
+    pub fn zuiWait(self: *Host, next: zui.NextFrame) void {
+        if (self.drawing) self.endDrawing() else c.PollInputEvents();
+        const deadline: ?zui.Instant = switch (next) {
+            .immediately => self.frame_began.addNanoseconds(self.frame_interval_ns),
+            .at => |instant| instant,
+            .on_event => null,
+        };
+        while (!self.woken.load(.acquire) and !os_event.arrived) {
+            if (deadline) |instant| {
+                const remaining = instant.nanoseconds -| self.now().nanoseconds;
+                if (remaining == 0) break;
+                glfw.glfwWaitEventsTimeout(@as(f64, @floatFromInt(remaining)) / std.time.ns_per_s);
+            } else {
+                glfw.glfwWaitEvents();
+            }
+        }
+        self.woken.store(false, .release);
+    }
+
+    pub fn zuiSurface(_: *Host, window: zui.WindowId) zui.Surface {
+        std.debug.assert(window == .main);
+        return .library;
+    }
+
+    /// Sets the cursor. raylib cannot place an IME window, so a text-input
+    /// request is not applied.
+    pub fn zuiApply(self: *Host, window: zui.WindowId, requests: zui.HostRequests) void {
+        std.debug.assert(window == .main);
         if (self.applied_cursor == requests.cursor) return;
         self.applied_cursor = requests.cursor;
         c.SetMouseCursor(mouseCursorFor(requests.cursor));
     }
+
+    pub fn now(self: *const Host) zui.Instant {
+        return .fromTimestamp(std.Io.Timestamp.now(self.io, .awake));
+    }
+
+    /// raylib polls input in `EndDrawing`, and an offscreen frame polls it
+    /// the same way.
+    fn endDrawing(self: *Host) void {
+        if (!self.drawing) return;
+        self.drawing = false;
+        if (self.offscreen != null) {
+            c.EndTextureMode();
+            c.PollInputEvents();
+        } else {
+            c.EndDrawing();
+            if (self.first_present == null) self.first_present = self.now();
+        }
+    }
+
+    fn nextScripted(self: *Host) ?zui.InputSampler.Sample {
+        if (self.scripted_count == 0) return null;
+        const sample = self.scripted[self.scripted_first];
+        self.scripted_first = (self.scripted_first + 1) % scripted_capacity;
+        self.scripted_count -= 1;
+        return sample;
+    }
+
+    /// GLFW lets any thread post an empty event, which ends a wait in
+    /// progress; the flag ends the next one.
+    fn wake(context: *anyopaque) void {
+        const self: *Host = @ptrCast(@alignCast(context));
+        self.woken.store(true, .release);
+        glfw.glfwPostEmptyEvent();
+    }
 };
+
+fn renderScale() f32 {
+    const screen_width = c.GetScreenWidth();
+    if (screen_width <= 0) return 1;
+    return @as(f32, @floatFromInt(c.GetRenderWidth())) / @as(f32, @floatFromInt(screen_width));
+}
 
 /// The nearest of raylib's cursors.
 pub fn mouseCursorFor(cursor: zui.Cursor) c_int {
@@ -225,12 +360,6 @@ pub const InputReader = struct {
     text: [max_text_bytes]u8 = undefined,
     events: [event_capacity]zui.Event = undefined,
     window_focused: bool = true,
-
-    /// The events since the last read. They point into the reader, so they
-    /// stay valid until the next read; `beginFrame` copies them.
-    pub fn read(self: *InputReader, at: zui.Instant, options: InputOptions) []const zui.Event {
-        return self.eventsFor(at, self.sample(options));
-    }
 
     /// What raylib polled, as one sample.
     pub fn sample(self: *InputReader, options: InputOptions) zui.InputSampler.Sample {
@@ -278,7 +407,8 @@ pub const InputReader = struct {
     }
 
     /// The events between the previous sample and `current`, then a focus
-    /// change if the window gained or lost focus.
+    /// change if the window gained or lost focus. They stay valid until
+    /// the next call.
     pub fn eventsFor(self: *InputReader, at: zui.Instant, current: zui.InputSampler.Sample) []const zui.Event {
         var count = self.sampler.sample(at, current, self.events[0 .. self.events.len - 1]).len;
         const focused = c.IsWindowFocused();
@@ -353,30 +483,51 @@ fn encodeCodepoint(codepoint: u21, destination: []u8) usize {
 }
 
 // =====================================================================
-// Rendering
+// The renderer, which is also the text contract
 // =====================================================================
 
-/// The renderer contract, through raylib. It draws into raylib's current
-/// target: the window between `BeginDrawing` and `EndDrawing`, or a render
-/// texture between `BeginTextureMode` and `EndTextureMode`. raylib owns
-/// that window, so its surface is `.library`.
+/// zui's renderer and text contracts through raylib. It draws into
+/// raylib's current target: the window between `BeginDrawing` and
+/// `EndDrawing`, or a render texture between `BeginTextureMode` and
+/// `EndTextureMode`. raylib owns that window, so its surface is
+/// `.library`. `FontId` indexes `fonts`; with none loaded, raylib's
+/// built-in font is used for every id. raylib's GL context belongs to the
+/// thread that opened the window, so it does not declare
+/// `zui_render_thread`.
 ///
 /// ```zig
-/// var renderer: zui_raylib.Renderer = .{ .text = &text };
-/// const frame = ui.endFrame();
-/// c.BeginDrawing();
-/// c.ClearBackground(.{ .r = 30, .g = 30, .b = 36, .a = 255 });
-/// try renderer.zuiSubmit(.library, frame);
-/// c.EndDrawing();
-/// ui.release(frame);
+/// const Ui = zui.Context(zui_app.contextConfig(zui_raylib.Renderer, .{}));
+/// var renderer: zui_raylib.Renderer = .{};
+/// var ui = try Ui.init(gpa, io, &renderer);
 /// ```
 pub const Renderer = struct {
     pub const zui_surfaces: zui.SurfaceKinds = .initOne(.library);
     pub const ImageHandle = Texture;
 
-    text: *const Text,
+    fonts: []const c.Font = &.{},
+    /// Space raylib's fonts need between glyphs, as a fraction of the size,
+    /// before the style's own letter spacing. raylib's `DrawText` uses 0.1.
+    font_spacing: f32 = 0.1,
     /// Segments per rounded corner; raylib picks automatically at 0.
     corner_segments: c_int = 0,
+
+    /// Each glyph counts its advance plus the spacing after it, so that
+    /// measuring "a", " " and "b" separately adds up to measuring "a b",
+    /// which zui relies on when it wraps. raylib's `MeasureTextEx` leaves
+    /// out the spacing after the last glyph.
+    pub fn zuiMeasure(self: *Renderer, run: []const u8, key: zui.MeasureKey(u16)) [2]f32 {
+        const raylib_font = self.fontFor(key.font);
+        const glyph_spacing = self.spacing(key.size, key.letter_spacing);
+        var width: f32 = 0;
+        var height: f32 = key.size;
+        var chunks: CStringChunks = .init(run);
+        while (chunks.next()) |chunk| {
+            const measured = c.MeasureTextEx(raylib_font, chunk.ptr, key.size, glyph_spacing);
+            width += measured.x + glyph_spacing;
+            height = @max(height, measured.y);
+        }
+        return .{ width, height };
+    }
 
     pub fn zuiSubmit(self: *Renderer, surface: zui.Surface, frame: anytype) error{UnsupportedSurface}!void {
         if (surface != .library) return error.UnsupportedSurface;
@@ -386,12 +537,58 @@ pub const Renderer = struct {
             switch (command.payload) {
                 .rectangle => |rectangle| drawRectangle(bounds, rectangle.color, rectangle.corner_radius, self.corner_segments),
                 .border => |border| drawBorder(bounds, border.color, border.widths, border.corner_radius, self.corner_segments),
-                .text => |line| drawText(self.text, line.content, bounds, line.style.font, line.style.size, line.style.letter_spacing, line.style.color),
+                .text => |line| self.drawText(line.content, bounds, line.style),
                 .image => |image| drawTexture(image.handle, bounds),
                 .clip_begin => |clip| scissors.push(clip),
                 .clip_end => scissors.pop(),
             }
         }
+    }
+
+    pub fn fontFor(self: *const Renderer, font: u16) c.Font {
+        return if (font < self.fonts.len) self.fonts[font] else c.GetFontDefault();
+    }
+
+    /// raylib's spacing between glyphs for text of `size` with the style's
+    /// `letter_spacing`.
+    pub fn spacing(self: *const Renderer, size: f32, letter_spacing: f32) f32 {
+        return size * self.font_spacing + letter_spacing;
+    }
+
+    fn drawText(self: *const Renderer, content: []const u8, bounds: zui.Rect, style: anytype) void {
+        const raylib_font = self.fontFor(style.font);
+        const glyph_spacing = self.spacing(style.size, style.letter_spacing);
+        var x = bounds.x;
+        var chunks: CStringChunks = .init(content);
+        while (chunks.next()) |chunk| {
+            c.DrawTextEx(raylib_font, chunk.ptr, .{ .x = x, .y = bounds.y }, style.size, glyph_spacing, toRaylibColor(style.color));
+            x += c.MeasureTextEx(raylib_font, chunk.ptr, style.size, glyph_spacing).x + glyph_spacing;
+        }
+    }
+};
+
+/// raylib takes NUL-terminated strings, and zui hands out slices into its
+/// frame buffer, so text is copied into this buffer one chunk at a time.
+const CStringChunks = struct {
+    const capacity = 1024;
+
+    remaining: []const u8,
+    buffer: [capacity + 1]u8 = undefined,
+
+    fn init(text: []const u8) CStringChunks {
+        return .{ .remaining = text };
+    }
+
+    /// The next chunk, split on a UTF-8 boundary so no code point is cut.
+    fn next(self: *CStringChunks) ?[:0]const u8 {
+        if (self.remaining.len == 0) return null;
+        var length = @min(self.remaining.len, capacity);
+        while (length < self.remaining.len and length > 0 and (self.remaining[length] & 0xC0) == 0x80) length -= 1;
+        if (length == 0) length = @min(self.remaining.len, capacity);
+        @memcpy(self.buffer[0..length], self.remaining[0..length]);
+        self.buffer[length] = 0;
+        self.remaining = self.remaining[length..];
+        return self.buffer[0..length :0];
     }
 };
 
@@ -436,17 +633,6 @@ fn drawBorder(bounds: zui.Rect, color: zui.Color, widths: zui.Edges, radius: zui
     c.DrawRectangleRec(.{ .x = bounds.x + bounds.width - widths.right, .y = bounds.y + widths.top, .width = widths.right, .height = bounds.height - widths.top - widths.bottom }, raylib_color);
 }
 
-fn drawText(text: *const Text, content: []const u8, bounds: zui.Rect, font: u16, size: f32, letter_spacing: f32, color: zui.Color) void {
-    const raylib_font = text.fontFor(font);
-    const spacing = text.spacing(size, letter_spacing);
-    var x = bounds.x;
-    var chunks: CStringChunks = .init(content);
-    while (chunks.next()) |chunk| {
-        c.DrawTextEx(raylib_font, chunk.ptr, .{ .x = x, .y = bounds.y }, size, spacing, toRaylibColor(color));
-        x += c.MeasureTextEx(raylib_font, chunk.ptr, size, spacing).x + spacing;
-    }
-}
-
 fn drawTexture(texture: Texture, bounds: zui.Rect) void {
     const source: c.Rectangle = .{ .x = 0, .y = 0, .width = @floatFromInt(texture.width), .height = @floatFromInt(texture.height) };
     c.DrawTexturePro(texture, source, toRaylibRectangle(bounds), .{ .x = 0, .y = 0 }, 0, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
@@ -488,7 +674,6 @@ const ScissorStack = struct {
 test "chunks are NUL-terminated and split on code point boundaries" {
     var long: [CStringChunks.capacity + 10]u8 = undefined;
     @memset(&long, 'a');
-    // A two-byte code point straddling the capacity boundary.
     long[CStringChunks.capacity - 1] = 0xC3;
     long[CStringChunks.capacity] = 0xA9;
     var chunks: CStringChunks = .init(&long);
@@ -530,9 +715,9 @@ test "raylib's keys map to zui's, letters and function keys included" {
 }
 
 test "the spacing after each glyph adds the style's letter spacing" {
-    const text: Text = .{};
-    try std.testing.expectEqual(@as(f32, 2), text.spacing(20, 0));
-    try std.testing.expectEqual(@as(f32, 5), text.spacing(20, 3));
+    const renderer: Renderer = .{};
+    try std.testing.expectEqual(@as(f32, 2), renderer.spacing(20, 0));
+    try std.testing.expectEqual(@as(f32, 5), renderer.spacing(20, 3));
 }
 
 test "every cursor maps to one of raylib's" {
@@ -540,23 +725,23 @@ test "every cursor maps to one of raylib's" {
     try std.testing.expectEqual(@as(c_int, c.MOUSE_CURSOR_POINTING_HAND), mouseCursorFor(.pointer));
 }
 
-test "config makes text raylib's and images raylib textures" {
-    const derived = config(.{ .limits = .{ .max_elements = 128 }, .CustomData = u32 });
+test "zui_app's config makes the renderer the text contract and images raylib textures" {
+    const derived = zui_app.contextConfig(Renderer, .{ .limits = .{ .max_elements = 128 }, .CustomData = u32 });
     try std.testing.expect(derived.ImageHandle == Texture);
-    try std.testing.expect(derived.Text == Text);
+    try std.testing.expect(derived.Text == Renderer);
     try std.testing.expect(derived.CustomData == void);
     try std.testing.expectEqual(@as(u32, 128), derived.limits.max_elements);
 }
 
 test "the renderer draws exactly the base commands and images, into raylib's own window" {
-    const Ui = zui.Context(config(.{ .limits = .{ .max_elements = 8 } }));
+    comptime zui.checkHostAndRenderer(Host, Renderer);
+    const Ui = zui.Context(zui_app.contextConfig(Renderer, .{ .limits = .{ .max_elements = 8 } }));
     try std.testing.expectEqual(6, @typeInfo(Ui.RenderCommand.Payload).@"union".fields.len);
-    var text: Text = .{};
-    var ui = try Ui.init(std.testing.allocator, std.testing.io, &text);
+    var renderer: Renderer = .{};
+    var ui = try Ui.init(std.testing.allocator, std.testing.io, &renderer);
     defer ui.deinit(std.testing.allocator);
     ui.beginFrame(&.{ .params = .{ .now = .zero, .viewport = .{ 100, 100 } } });
     const frame = ui.endFrame();
     defer ui.release(frame);
-    var renderer: Renderer = .{ .text = &text };
     try std.testing.expectError(error.UnsupportedSurface, renderer.zuiSubmit(.{ .offscreen = .{ .size = .{ 100, 100 } } }, frame));
 }

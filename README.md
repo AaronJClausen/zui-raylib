@@ -1,10 +1,11 @@
 # zui-raylib
 
 A [raylib](https://www.raylib.com) backend for
-[zui](https://github.com/AaronJClausen/zui): it turns raylib's input into
-zui's frame records, measures text with raylib fonts through zui's text
-contract, draws zui's frames as a renderer (zui's renderer contract), and
-sleeps until zui's next frame is due. It also contains zui's reference application.
+[zui](https://github.com/AaronJClausen/zui): a renderer (zui's renderer and
+text contracts, with raylib's fonts) and an adapter host (zui's host
+contract on raylib's window), so an application runs on it through
+`zui_app` in one call. It also contains zui's reference application, which
+does.
 
 ![The demo application](docs/demo.png)
 
@@ -26,6 +27,7 @@ zig build demo -- --screenshot demo.png --about       # ...with the About dialog
 zig build demo -- --screenshot grid.png --thumbnails  # ...in the thumbnail grid
 zig build demo -- --screenshot settings.png --settings  # ...in the settings editor
 zig build demo -- --measure-idle --thumbnails         # report the CPU used over 10 idle seconds
+zig build demo -- --measure-startup                   # report the time from process start to the first presented frame
 zig build demo -Dzui-tracy=true                       # trace zui's zones into Tracy 0.14.1
 ```
 
@@ -67,12 +69,26 @@ after 5 seconds of warm-up. On Windows 11 (i9-10900K, ReleaseSafe):
 
 | View | CPU over 10 idle seconds | Frames | Wakes |
 |---|---|---|---|
-| Documents | 31–47 ms | 1 | 0 |
-| Thumbnails | 0.0 ms | 1 | 0 |
-| Settings | 0.0 ms | 1 | 0 |
+| Documents | 0.0–31.3 ms | 1 | 0 |
+| Thumbnails | 31.3–46.9 ms | 1 | 0 |
+| Settings | 15.6 ms | 1 | 0 |
 
-The one frame is the measurement's own, and Windows counts CPU time in
-15.6 ms ticks, so the wait itself uses none.
+The one frame is the measurement's own, drawn and presented, and Windows
+counts CPU time in 15.6 ms ticks, so the wait itself uses none.
+
+`--measure-startup` runs the demo in a hidden window and, in its second
+frame, reports how long after the OS created the process the first frame
+was presented (Windows only: it reads the process's creation time). Six
+runs on the same machine:
+
+| Build | Fastest | Median | Of which, opening raylib's window |
+|---|---|---|---|
+| ReleaseSafe | 287.5 ms | 316 ms | all but 4.3–5.1 ms |
+| ReleaseFast | 296.1 ms | 319 ms | all but 2.7–4.8 ms |
+
+zui's part, from the window being open to the first frame on screen
+(`init`, the first frame's layout, drawing and presenting), is about 5 ms;
+the rest is raylib creating the window and its OpenGL context.
 
 A hundred loads finishing between two frames wake the window once: the
 test `100 loads finishing between two frames cause one wake` in
@@ -81,12 +97,18 @@ them on 100 tasks, and counts the wakes.
 
 ## Conformance
 
-`zig build conformance` runs zui's renderer suite
-(`zui_testing.expectRendererConforms`) against the renderer, in a hidden
-window: `src/conformance.zig` draws each frame into a render texture and
-reads it back with `LoadImageFromTexture`, so the suite checks every clip
-and fill by its pixels. It needs a display, so `zig build test` leaves it
-out; CI runs it on Linux under `xvfb-run`, and it passes on Windows.
+`zig build conformance` runs zui's two suites in hidden windows:
+- the renderer suite (`zui_testing.expectRendererConforms`):
+  `src/conformance.zig` draws each frame into a render texture and reads
+  it back with `LoadImageFromTexture`, so the suite checks every clip and
+  fill by its pixels;
+- the host suite (`zui_testing.expectHostConforms`): raylib reports state,
+  not events, so the harness's `post` scripts the state
+  `zui.InputSampler` reads (`Host.script`), and the suite checks the
+  events' order, the waits and the wakes against the real window.
+
+It needs a display, so `zig build test` leaves it out; CI runs it on
+Linux under `xvfb-run`, and it passes on Windows.
 
 ## Developing against a local zui
 
@@ -115,51 +137,56 @@ exe.root_module.addImport("zui_raylib", backend.module("zui_raylib"));
 ```zig
 const zui_raylib = @import("zui_raylib");
 const zui = zui_raylib.zui; // the same zui the backend was built with
-const zui_async = zui_raylib.zui_async; // and its optional modules
-const c = zui_raylib.c;
+const zui_app = zui_raylib.zui_app; // and its optional modules
 
-const Ui = zui.Context(zui_raylib.config(.{ .Sources = AppSources }));
+const App = struct {
+    pub const Host = zui_raylib.Host;
+    pub const Renderer = zui_raylib.Renderer;
+    pub const Ui = zui.Context(zui_app.contextConfig(Renderer, .{ .Sources = AppSources }));
 
-var text: zui_raylib.Text = .{}; // or .{ .fonts = &my_fonts }
-var ui = try Ui.init(gpa, io, &text);
-var renderer: zui_raylib.Renderer = .{ .text = &text };
-var input: zui_raylib.InputReader = .{};
-var pacer: zui_raylib.FramePacer = .{ .io = io };
-defer pacer.deinit();
-var host_requests: zui_raylib.HostRequestApplier = .{};
+    sources: AppSources = .{},
 
-while (!c.WindowShouldClose()) {
-    const now = zui_raylib.now(io);
-    ui.beginFrame(&.{ .params = zui_raylib.windowParams(now), .events = input.read(now, .{}) }, &app.sources);
-    // ... declare your UI ...
-    const frame = ui.endFrame();
-    c.BeginDrawing();
-    c.ClearBackground(.{ .r = 22, .g = 22, .b = 28, .a = 255 });
-    try renderer.zuiSubmit(.library, frame);
-    host_requests.apply(frame.requests());
-    app.load(&ui); // the loader: start what the frame asked for
-    pacer.prepare(ui.nextFrame(&app.sources));
-    c.EndDrawing(); // presents, then sleeps as nextFrame said
-    ui.release(frame);
+    pub fn zuiDeclare(app: *App, ui: *Ui) void {
+        // ... declare your UI ...
+    }
+
+    pub fn zuiLoader(app: *App, ui: *const Ui, io: std.Io) void {
+        // ... start what the frame asked for ...
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    try zui_app.run(App, init, .{ .title = "My app", .size = .{ 1100, 700 } });
 }
 ```
 
-`zui_raylib.Renderer` implements zui's renderer contract. Its surface is
-`.library`: raylib's own window between `BeginDrawing` and `EndDrawing`,
-or a render texture between `BeginTextureMode` and `EndTextureMode`.
-`zui_raylib.config(...)` builds the `Config` from its declarations: `Text`
-is `zui_raylib.Text`, `ImageHandle` is raylib's `Texture2D`, so
-`ui.image(.{ .handle = texture }, ...)` draws directly, and there are no
-optional commands and no `CustomData`. The renderer's `switch` over the
-commands therefore names exactly the base commands and `image`.
+`zui_raylib.Renderer` implements zui's renderer and text contracts. Its
+surface is `.library`: raylib's own window between `BeginDrawing` and
+`EndDrawing`, or a render texture between `BeginTextureMode` and
+`EndTextureMode`. `zui_app.contextConfig` builds the `Config` from its
+declarations: the renderer measures text, `ImageHandle` is raylib's
+`Texture2D`, so `ui.image(.{ .handle = texture }, ...)` draws directly,
+and there are no optional commands and no `CustomData`. The renderer's
+`switch` over the commands therefore names exactly the base commands and
+`image`. raylib's OpenGL context belongs to the thread that opened the
+window, so it does not declare `zui_render_thread`, and `zui_app` submits
+on the UI thread.
 
-`FramePacer` makes `EndDrawing` wait for events when `nextFrame` is
-`.on_event`, not wait when it is `.immediately`, and for `.at` arms a
-timer that wakes the wait at that instant. `zui_raylib.waker()` is a
-`zui.Waker` for sources' producers; it calls `glfwPostEmptyEvent`
-(compiled into raylib's default desktop GLFW platform), which any thread
-may call and which stays queued until the next wait, so a wake between
-`nextFrame` and `EndDrawing` is not lost.
+`zui_raylib.Host` implements zui's host contract with one window and no
+system material. `zuiPoll` samples raylib's input and begins drawing;
+`zuiWait` presents, then sleeps in GLFW (compiled into raylib's default
+desktop platform) until input arrives, the host is woken, or the instant
+`nextFrame` names, and `.immediately` waits out the monitor's refresh
+interval. Its `zuiWaker` sets a flag and posts an empty GLFW event, which
+any thread may do; the flag is cleared only after a wait, so a wake
+between `nextFrame` and the wait is not lost. Escape does not close the
+window, since the application may want it. Beyond the contract:
+- `drawOffscreen()` and `saveScreenshot(path)` draw into a texture and
+  save it, as the demo's `--screenshot` does;
+- `script(sample)` replaces raylib's input for one poll, as the host
+  suite and the demo's screenshots do;
+- `close()` closes the window as its close button would;
+- `clear_color` is what each frame is cleared to.
 
 ## What the backend maps, and how
 
@@ -174,7 +201,8 @@ may call and which stays queued until the next wait, so a wake between
 | wheel | `GetMouseWheelMoveV`, flipped and scaled by `InputOptions.wheel_step` |
 | focus | `IsWindowFocused` changes, as the environment's `window_focused` |
 | scale | `GetRenderWidth() / GetScreenWidth()`, as the record's scale |
-| cursor request | `SetMouseCursor`, through `HostRequestApplier` |
+| cursor request | `SetMouseCursor`, in `Host.zuiApply` |
+| waits and wakes | GLFW's `glfwWaitEvents`, `glfwWaitEventsTimeout` and `glfwPostEmptyEvent` |
 
 Limits worth knowing:
 - **Sampled input.** raylib reports state once per frame, so a press and
@@ -182,13 +210,14 @@ Limits worth knowing:
 - **Corner radii.** raylib rounds all four corners the same, so the
   largest of zui's four radii is used.
 - **Letter spacing.** Text is measured glyph by glyph with the spacing
-  after each glyph included: raylib's fonts need `Text.font_spacing` of
-  the size, and the style adds its own. zui measures words and spaces
+  after each glyph included: raylib's fonts need `Renderer.font_spacing`
+  of the size, and the style adds its own. zui measures words and spaces
   separately and adds them up, so measurement has to be additive, and
   raylib's own `MeasureTextEx` leaves out the spacing after the last
   glyph.
 - **No IME window.** raylib cannot place one, so a text-input request is
   not applied.
+- **One window.** `zui_capabilities.windows` is `.one`.
 
 ## License
 
