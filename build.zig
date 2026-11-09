@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zui_async", .module = zui_async_module },
             .{ .name = "zui_tracy", .module = zui_dependency.module("zui_tracy") },
             .{ .name = "raylib", .module = raylib_module },
+            .{ .name = "rlgl", .module = raylib_dependency.module("rlgl") },
         },
     });
 

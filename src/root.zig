@@ -13,6 +13,9 @@ pub const zui_tracy = @import("zui_tracy");
 
 /// The raw raylib bindings, translated from raylib.h.
 pub const c = @import("raylib");
+/// raylib's immediate-mode layer, for the textured triangles raylib
+/// itself does not draw.
+const rlgl = @import("rlgl");
 
 pub const Texture = c.Texture2D;
 
@@ -508,7 +511,9 @@ pub const Renderer = struct {
     /// Space raylib's fonts need between glyphs, as a fraction of the size,
     /// before the style's own letter spacing. raylib's `DrawText` uses 0.1.
     font_spacing: f32 = 0.1,
-    /// Segments per rounded corner; raylib picks automatically at 0.
+    /// Segments per rounded corner; at 0, raylib picks for rectangles and
+    /// borders, and an image's corners take one segment per two units of
+    /// radius.
     corner_segments: c_int = 0,
 
     /// Each glyph counts its advance plus the spacing after it, so that
@@ -538,7 +543,7 @@ pub const Renderer = struct {
                 .rectangle => |rectangle| drawRectangle(bounds, rectangle.color, rectangle.corner_radius, self.corner_segments),
                 .border => |border| drawBorder(bounds, border.color, border.widths, border.corner_radius, self.corner_segments),
                 .text => |line| self.drawText(line.content, bounds, line.style),
-                .image => |image| drawTexture(image.handle, bounds),
+                .image => |image| drawImage(image.handle, bounds, image.tint, image.corner_radius, self.corner_segments),
                 .clip_begin => |clip| scissors.push(clip),
                 .clip_end => scissors.pop(),
             }
@@ -633,10 +638,77 @@ fn drawBorder(bounds: zui.Rect, color: zui.Color, widths: zui.Edges, radius: zui
     c.DrawRectangleRec(.{ .x = bounds.x + bounds.width - widths.right, .y = bounds.y + widths.top, .width = widths.right, .height = bounds.height - widths.top - widths.bottom }, raylib_color);
 }
 
-fn drawTexture(texture: Texture, bounds: zui.Rect) void {
-    const source: c.Rectangle = .{ .x = 0, .y = 0, .width = @floatFromInt(texture.width), .height = @floatFromInt(texture.height) };
-    c.DrawTexturePro(texture, source, toRaylibRectangle(bounds), .{ .x = 0, .y = 0 }, 0, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+fn hasRoundedCorners(radius: zui.CornerRadius) bool {
+    return radius.top_left > 0 or radius.top_right > 0 or radius.bottom_left > 0 or radius.bottom_right > 0;
 }
+
+/// raylib multiplies a texture by a tint, but cannot round its corners,
+/// so a rounded image is a fan of textured triangles from its center.
+fn drawImage(texture: Texture, bounds: zui.Rect, tint: zui.Color, radius: zui.CornerRadius, corner_segments: c_int) void {
+    if (!hasRoundedCorners(radius) or bounds.width <= 0 or bounds.height <= 0) {
+        const source: c.Rectangle = .{ .x = 0, .y = 0, .width = @floatFromInt(texture.width), .height = @floatFromInt(texture.height) };
+        c.DrawTexturePro(texture, source, toRaylibRectangle(bounds), .{ .x = 0, .y = 0 }, 0, toRaylibColor(tint));
+        return;
+    }
+    var outline: ImageOutline = .{};
+    outline.trace(bounds, radius, corner_segments);
+    const center: [2]f32 = .{ bounds.x + bounds.width / 2, bounds.y + bounds.height / 2 };
+    _ = rlgl.rlCheckRenderBatchLimit(@intCast(3 * outline.count));
+    rlgl.rlSetTexture(texture.id);
+    rlgl.rlBegin(rlgl.RL_TRIANGLES);
+    rlgl.rlColor4ub(tint.r, tint.g, tint.b, tint.a);
+    for (0..outline.count) |index| {
+        const next = (index + 1) % outline.count;
+        for ([3][2]f32{ center, outline.points[index], outline.points[next] }) |point| {
+            rlgl.rlTexCoord2f((point[0] - bounds.x) / bounds.width, (point[1] - bounds.y) / bounds.height);
+            rlgl.rlVertex2f(point[0], point[1]);
+        }
+    }
+    rlgl.rlEnd();
+    rlgl.rlSetTexture(0);
+}
+
+/// The points around a rounded rectangle, each corner with its own radius,
+/// counter-clockwise on screen from the top of the top-left corner, as
+/// raylib's culling wants triangles wound.
+const ImageOutline = struct {
+    const max_segments = 32;
+
+    points: [4 * (max_segments + 1)][2]f32 = undefined,
+    count: usize = 0,
+
+    fn trace(self: *ImageOutline, bounds: zui.Rect, radius: zui.CornerRadius, corner_segments: c_int) void {
+        const limit = @min(bounds.width, bounds.height) / 2;
+        const left = bounds.x;
+        const top = bounds.y;
+        const right = bounds.x + bounds.width;
+        const bottom = bounds.y + bounds.height;
+        const corners = [4]struct { x: f32, y: f32, radius: f32, toward_x: f32, toward_y: f32 }{
+            .{ .x = left, .y = top, .radius = radius.top_left, .toward_x = 1, .toward_y = 1 },
+            .{ .x = left, .y = bottom, .radius = radius.bottom_left, .toward_x = 1, .toward_y = -1 },
+            .{ .x = right, .y = bottom, .radius = radius.bottom_right, .toward_x = -1, .toward_y = -1 },
+            .{ .x = right, .y = top, .radius = radius.top_right, .toward_x = -1, .toward_y = 1 },
+        };
+        self.count = 0;
+        for (corners, 0..) |corner, corner_index| {
+            const corner_radius = std.math.clamp(corner.radius, 0, limit);
+            const segments: usize = if (corner_radius == 0) 0 else if (corner_segments > 0)
+                @intCast(@min(corner_segments, max_segments))
+            else
+                @intFromFloat(std.math.clamp(@ceil(corner_radius / 2), 4, max_segments));
+            const arc_x = corner.x + corner.toward_x * corner_radius;
+            const arc_y = corner.y + corner.toward_y * corner_radius;
+            // Angles are measured with y pointing down, so a decreasing angle
+            // turns counter-clockwise on screen.
+            const start_angle = 1.5 * std.math.pi - 0.5 * std.math.pi * @as(f32, @floatFromInt(corner_index));
+            for (0..segments + 1) |step| {
+                const angle = start_angle - 0.5 * std.math.pi * @as(f32, @floatFromInt(step)) / @as(f32, @floatFromInt(@max(segments, 1)));
+                self.points[self.count] = .{ arc_x + @cos(angle) * corner_radius, arc_y + @sin(angle) * corner_radius };
+                self.count += 1;
+            }
+        }
+    }
+};
 
 /// zui's clip rectangles are already intersected with every enclosing
 /// clip, so restoring the enclosing one on `clip_end` is all that is needed.
@@ -692,6 +764,23 @@ test "roundness uses the largest radius against the shorter side" {
     try std.testing.expectEqual(@as(f32, 0.5), roundness(bounds, .all(10)));
     try std.testing.expectEqual(@as(f32, 0.5), roundness(bounds, .{ .top_left = 10, .bottom_right = 4 }));
     try std.testing.expectEqual(@as(f32, 1), roundness(bounds, .all(500)));
+}
+
+test "an image's outline rounds each corner by its own radius, wound counter-clockwise on screen" {
+    var outline: ImageOutline = .{};
+    outline.trace(.{ .x = 10, .y = 20, .width = 100, .height = 40 }, .{ .top_left = 8, .bottom_right = 500 }, 4);
+    try std.testing.expectEqual(@as(usize, 5 + 1 + 5 + 1), outline.count);
+    try std.testing.expectApproxEqAbs(@as(f32, 18), outline.points[0][0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), outline.points[0][1], 0.001);
+    try std.testing.expectEqual([2]f32{ 10, 60 }, outline.points[5]);
+    try std.testing.expectEqual([2]f32{ 110, 20 }, outline.points[11]);
+    var twice_signed_area: f32 = 0;
+    for (0..outline.count) |index| {
+        const here = outline.points[index];
+        const next = outline.points[(index + 1) % outline.count];
+        twice_signed_area += here[0] * next[1] - next[0] * here[1];
+    }
+    try std.testing.expect(twice_signed_area < 0);
 }
 
 test "the wheel is flipped and scaled into layout units" {

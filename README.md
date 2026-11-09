@@ -101,7 +101,7 @@ them on 100 tasks, and counts the wakes.
 - the renderer suite (`zui_testing.expectRendererConforms`):
   `src/conformance.zig` draws each frame into a render texture and reads
   it back with `LoadImageFromTexture`, so the suite checks every clip and
-  fill by its pixels;
+  fill, and the image's tint and rounded corners, by their pixels;
 - the host suite (`zui_testing.expectHostConforms`): raylib reports state,
   not events, so the harness's `post` scripts the state
   `zui.InputSampler` reads (`Host.script`), and the suite checks the
@@ -195,7 +195,7 @@ window, since the application may want it. Beyond the contract:
 | `rectangle` | `DrawRectangleRec`, or `DrawRectangleRounded` with a corner radius |
 | `border` | four bands inside the bounds; `DrawRectangleRoundedLinesEx` when uniform and rounded |
 | `text` | `DrawTextEx`, one call per wrapped line, with the style's letter spacing |
-| `image` | `DrawTexturePro` |
+| `image` | `DrawTexturePro` with the tint; with a corner radius, a fan of textured triangles through rlgl, each corner with its own radius |
 | `clip_begin` / `clip_end` | `BeginScissorMode` / `EndScissorMode` with a stack |
 | pointer and keys | raylib's polled state, through `zui.InputSampler`; keys from `GetKeyPressed`, letters, digits and function keys included |
 | wheel | `GetMouseWheelMoveV`, flipped and scaled by `InputOptions.wheel_step` |
@@ -207,8 +207,9 @@ window, since the application may want it. Beyond the contract:
 Limits worth knowing:
 - **Sampled input.** raylib reports state once per frame, so a press and
   release between two frames is lost, as it is to raylib itself.
-- **Corner radii.** raylib rounds all four corners the same, so the
-  largest of zui's four radii is used.
+- **Corner radii.** raylib rounds all four corners of a rectangle or a
+  border the same, so the largest of zui's four radii is used; an image
+  rounds each corner by its own.
 - **Letter spacing.** Text is measured glyph by glyph with the spacing
   after each glyph included: raylib's fonts need `Renderer.font_spacing`
   of the size, and the style adds its own. zui measures words and spaces
