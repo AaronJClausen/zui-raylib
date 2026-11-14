@@ -234,8 +234,11 @@ pub const Host = struct {
         }
         const at = self.now();
         self.frame_began = at;
-        record.begin(.{ .now = at, .viewport = .{ @floatFromInt(c.GetScreenWidth()), @floatFromInt(c.GetScreenHeight()) }, .scale = renderScale() });
-        const sample = self.nextScripted() orelse self.reader.sample(self.input);
+        // raylib's screen is already in layout units at a scale of 1; the
+        // zoom is the application's, kept from the record before.
+        const zoom = record.params.zoom;
+        record.begin(.{ .now = at, .viewport = .{ @as(f32, @floatFromInt(c.GetScreenWidth())) / zoom, @as(f32, @floatFromInt(c.GetScreenHeight())) / zoom }, .scale = renderScale() });
+        const sample = self.nextScripted() orelse self.reader.sample(self.input, zoom);
         for (self.reader.eventsFor(at, sample)) |event| switch (event) {
             .text => |text| record.appendText(text),
             else => record.append(event),
@@ -364,8 +367,9 @@ pub const InputReader = struct {
     events: [event_capacity]zui.Event = undefined,
     window_focused: bool = true,
 
-    /// What raylib polled, as one sample.
-    pub fn sample(self: *InputReader, options: InputOptions) zui.InputSampler.Sample {
+    /// What raylib polled, as one sample, with the pointer in layout units
+    /// at `zoom`.
+    pub fn sample(self: *InputReader, options: InputOptions, zoom: f32) zui.InputSampler.Sample {
         var buttons: std.EnumSet(zui.Button) = .initEmpty();
         if (c.IsMouseButtonDown(c.MOUSE_BUTTON_LEFT)) buttons.insert(.primary);
         if (c.IsMouseButtonDown(c.MOUSE_BUTTON_RIGHT)) buttons.insert(.secondary);
@@ -395,7 +399,7 @@ pub const InputReader = struct {
 
         const pointer = c.GetMousePosition();
         return .{
-            .pointer = if (c.IsCursorOnScreen()) .{ pointer.x, pointer.y } else null,
+            .pointer = if (c.IsCursorOnScreen()) .{ pointer.x / zoom, pointer.y / zoom } else null,
             .buttons = buttons,
             .wheel = wheelToScroll(c.GetMouseWheelMoveV(), options.wheel_step),
             .keys_pressed = self.keys[0..key_count],
@@ -493,14 +497,14 @@ fn encodeCodepoint(codepoint: u21, destination: []u8) usize {
 /// raylib's current target: the window between `BeginDrawing` and
 /// `EndDrawing`, or a render texture between `BeginTextureMode` and
 /// `EndTextureMode`. raylib owns that window, so its surface is
-/// `.library`. `FontId` indexes `fonts`; with none loaded, raylib's
-/// built-in font is used for every id. raylib's GL context belongs to the
-/// thread that opened the window, so it does not declare
-/// `zui_render_thread`.
+/// `.library`. `FontId` indexes `fonts`; an id past them is raylib's
+/// built-in font. raylib's GL context belongs to the thread that opened
+/// the window, so it does not declare `zui_render_thread`.
 ///
 /// ```zig
 /// const Ui = zui.Context(zui_app.contextConfig(zui_raylib.Renderer, .{}));
-/// var renderer: zui_raylib.Renderer = .{};
+/// var fonts = [_]zui_raylib.c.Font{try zui_raylib.loadTrueTypeFont(@embedFile("Inter-Regular.ttf"), 64)};
+/// var renderer: zui_raylib.Renderer = .{ .fonts = &fonts };
 /// var ui = try Ui.init(gpa, io, &renderer);
 /// ```
 pub const Renderer = struct {
@@ -508,9 +512,11 @@ pub const Renderer = struct {
     pub const ImageHandle = Texture;
 
     fonts: []const c.Font = &.{},
-    /// Space raylib's fonts need between glyphs, as a fraction of the size,
-    /// before the style's own letter spacing. raylib's `DrawText` uses 0.1.
-    font_spacing: f32 = 0.1,
+    /// Space after a glyph that has no advance of its own, as a fraction of
+    /// the size: raylib's built-in font and image fonts need it, as
+    /// raylib's `DrawText` gives them 0.1. A TrueType glyph advances by its
+    /// own width.
+    bitmap_glyph_spacing: f32 = 0.1,
     /// Segments per rounded corner; at 0, raylib picks for rectangles and
     /// borders, and an image's corners take one segment per two units of
     /// radius.
@@ -519,24 +525,25 @@ pub const Renderer = struct {
     /// Each glyph counts its advance plus the spacing after it, so that
     /// measuring "a", " " and "b" separately adds up to measuring "a b",
     /// which zui relies on when it wraps. raylib's `MeasureTextEx` leaves
-    /// out the spacing after the last glyph.
+    /// out the spacing after the last glyph, and measures nothing until
+    /// the font's atlas is on the GPU.
     pub fn zuiMeasure(self: *Renderer, run: []const u8, key: zui.MeasureKey(u16)) [2]f32 {
-        const raylib_font = self.fontFor(key.font);
-        const glyph_spacing = self.spacing(key.size, key.letter_spacing);
+        const font = self.fontFor(key.font);
         var width: f32 = 0;
-        var height: f32 = key.size;
-        var chunks: CStringChunks = .init(run);
-        while (chunks.next()) |chunk| {
-            const measured = c.MeasureTextEx(raylib_font, chunk.ptr, key.size, glyph_spacing);
-            width += measured.x + glyph_spacing;
-            height = @max(height, measured.y);
-        }
-        return .{ width, height };
+        var codepoints: Codepoints = .{ .text = run };
+        while (codepoints.next()) |codepoint| width += self.advance(font, codepoint, key.size, key.letter_spacing);
+        return .{ width, key.size };
     }
 
+    /// Draws in layout units, scaled by the frame's zoom; raylib maps its
+    /// screen to physical pixels itself.
     pub fn zuiSubmit(self: *Renderer, surface: zui.Surface, frame: anytype) error{UnsupportedSurface}!void {
         if (surface != .library) return error.UnsupportedSurface;
-        var scissors: ScissorStack = .{};
+        const zoom = frame.params.zoom;
+        rlgl.rlPushMatrix();
+        defer rlgl.rlPopMatrix();
+        rlgl.rlScalef(zoom, zoom, 1);
+        var scissors: ScissorStack = .{ .zoom = zoom };
         for (frame.commands()) |command| {
             const bounds = command.bounds;
             switch (command.payload) {
@@ -554,48 +561,81 @@ pub const Renderer = struct {
         return if (font < self.fonts.len) self.fonts[font] else c.GetFontDefault();
     }
 
-    /// raylib's spacing between glyphs for text of `size` with the style's
-    /// `letter_spacing`.
-    pub fn spacing(self: *const Renderer, size: f32, letter_spacing: f32) f32 {
-        return size * self.font_spacing + letter_spacing;
+    /// How far a glyph moves the pen at `size`, the style's letter spacing
+    /// included. It reads only the glyphs' metrics, so it measures without
+    /// a window, as a headless test does; a font with no glyphs, as
+    /// raylib's built-in one is before the window opens, measures nothing.
+    pub fn advance(self: *const Renderer, font: c.Font, codepoint: c_int, size: f32, letter_spacing: f32) f32 {
+        if (font.glyphs == null or font.glyphCount == 0 or font.baseSize <= 0) return letter_spacing;
+        const index: usize = @intCast(c.GetGlyphIndex(font, codepoint));
+        const glyph = font.glyphs[index];
+        const scale = size / @as(f32, @floatFromInt(font.baseSize));
+        if (glyph.advanceX > 0) return @as(f32, @floatFromInt(glyph.advanceX)) * scale + letter_spacing;
+        const glyph_width = font.recs[index].width + @as(f32, @floatFromInt(glyph.offsetX));
+        return glyph_width * scale + size * self.bitmap_glyph_spacing + letter_spacing;
     }
 
     fn drawText(self: *const Renderer, content: []const u8, bounds: zui.Rect, style: anytype) void {
-        const raylib_font = self.fontFor(style.font);
-        const glyph_spacing = self.spacing(style.size, style.letter_spacing);
+        const font = self.fontFor(style.font);
+        const color = toRaylibColor(style.color);
         var x = bounds.x;
-        var chunks: CStringChunks = .init(content);
-        while (chunks.next()) |chunk| {
-            c.DrawTextEx(raylib_font, chunk.ptr, .{ .x = x, .y = bounds.y }, style.size, glyph_spacing, toRaylibColor(style.color));
-            x += c.MeasureTextEx(raylib_font, chunk.ptr, style.size, glyph_spacing).x + glyph_spacing;
+        var codepoints: Codepoints = .{ .text = content };
+        while (codepoints.next()) |codepoint| {
+            if (codepoint != ' ' and codepoint != '\t') c.DrawTextCodepoint(font, codepoint, .{ .x = x, .y = bounds.y }, style.size, color);
+            x += self.advance(font, codepoint, style.size, style.letter_spacing);
         }
     }
 };
 
-/// raylib takes NUL-terminated strings, and zui hands out slices into its
-/// frame buffer, so text is copied into this buffer one chunk at a time.
-const CStringChunks = struct {
-    const capacity = 1024;
+/// The code points of UTF-8 text; a byte that starts no valid sequence is
+/// a '?', as raylib reads it.
+const Codepoints = struct {
+    text: []const u8,
+    index: usize = 0,
 
-    remaining: []const u8,
-    buffer: [capacity + 1]u8 = undefined,
-
-    fn init(text: []const u8) CStringChunks {
-        return .{ .remaining = text };
-    }
-
-    /// The next chunk, split on a UTF-8 boundary so no code point is cut.
-    fn next(self: *CStringChunks) ?[:0]const u8 {
-        if (self.remaining.len == 0) return null;
-        var length = @min(self.remaining.len, capacity);
-        while (length < self.remaining.len and length > 0 and (self.remaining[length] & 0xC0) == 0x80) length -= 1;
-        if (length == 0) length = @min(self.remaining.len, capacity);
-        @memcpy(self.buffer[0..length], self.remaining[0..length]);
-        self.buffer[length] = 0;
-        self.remaining = self.remaining[length..];
-        return self.buffer[0..length :0];
+    fn next(self: *Codepoints) ?c_int {
+        if (self.index == self.text.len) return null;
+        const decoded: ?u21 = decoded: {
+            const length = std.unicode.utf8ByteSequenceLength(self.text[self.index]) catch break :decoded null;
+            if (self.index + length > self.text.len) break :decoded null;
+            const codepoint = std.unicode.utf8Decode(self.text[self.index..][0..length]) catch break :decoded null;
+            self.index += length;
+            break :decoded codepoint;
+        };
+        if (decoded) |codepoint| return codepoint;
+        self.index += 1;
+        return '?';
     }
 };
+
+/// Glyphs between a font's glyphs in its atlas, so mipmaps do not bleed.
+const atlas_glyph_padding = 4;
+
+/// A TrueType font's printable ASCII glyphs, rasterized at `pixel_size`
+/// into an atlas drawn at every size through trilinear mipmaps. The atlas
+/// goes to the GPU only while raylib's window is open; without it, the
+/// font still measures. `data` need not outlive the call.
+pub fn loadTrueTypeFont(data: []const u8, pixel_size: c_int) error{InvalidFont}!c.Font {
+    var font: c.Font = .{ .baseSize = pixel_size, .glyphPadding = atlas_glyph_padding };
+    const printable_ascii_count = 95;
+    font.glyphs = c.LoadFontData(data.ptr, @intCast(data.len), pixel_size, null, printable_ascii_count, c.FONT_DEFAULT, &font.glyphCount);
+    if (font.glyphs == null) return error.InvalidFont;
+    const atlas = c.GenImageFontAtlas(font.glyphs, &font.recs, font.glyphCount, pixel_size, atlas_glyph_padding, 0);
+    defer c.UnloadImage(atlas);
+    if (c.IsWindowReady()) {
+        font.texture = c.LoadTextureFromImage(atlas);
+        c.GenTextureMipmaps(&font.texture);
+        c.SetTextureFilter(font.texture, c.TEXTURE_FILTER_TRILINEAR);
+    }
+    return font;
+}
+
+/// Frees a font from `loadTrueTypeFont`, its atlas only if it was uploaded.
+pub fn unloadFont(font: c.Font) void {
+    c.UnloadFontData(font.glyphs, font.glyphCount);
+    c.MemFree(font.recs);
+    if (font.texture.id != 0) c.UnloadTexture(font.texture);
+}
 
 fn toRaylibRectangle(rect: zui.Rect) c.Rectangle {
     return .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = rect.height };
@@ -713,6 +753,8 @@ const ImageOutline = struct {
 /// zui's clip rectangles are already intersected with every enclosing
 /// clip, so restoring the enclosing one on `clip_end` is all that is needed.
 const ScissorStack = struct {
+    /// raylib's scissor is in screen units, which the drawing's zoom does not reach.
+    zoom: f32,
     rects: [64]zui.Rect = undefined,
     depth: usize = 0,
     overflow: usize = 0,
@@ -724,7 +766,7 @@ const ScissorStack = struct {
         }
         self.rects[self.depth] = rect;
         self.depth += 1;
-        apply(rect);
+        self.apply(rect);
     }
 
     fn pop(self: *ScissorStack) void {
@@ -735,27 +777,25 @@ const ScissorStack = struct {
         if (self.depth == 0) return;
         self.depth -= 1;
         c.EndScissorMode();
-        if (self.depth > 0) apply(self.rects[self.depth - 1]);
+        if (self.depth > 0) self.apply(self.rects[self.depth - 1]);
     }
 
-    fn apply(rect: zui.Rect) void {
-        c.BeginScissorMode(@intFromFloat(@floor(rect.x)), @intFromFloat(@floor(rect.y)), @intFromFloat(@ceil(rect.width)), @intFromFloat(@ceil(rect.height)));
+    fn apply(self: *const ScissorStack, rect: zui.Rect) void {
+        const left = @floor(rect.x * self.zoom);
+        const top = @floor(rect.y * self.zoom);
+        const right = @ceil((rect.x + rect.width) * self.zoom);
+        const bottom = @ceil((rect.y + rect.height) * self.zoom);
+        c.BeginScissorMode(@intFromFloat(left), @intFromFloat(top), @intFromFloat(right - left), @intFromFloat(bottom - top));
     }
 };
 
-test "chunks are NUL-terminated and split on code point boundaries" {
-    var long: [CStringChunks.capacity + 10]u8 = undefined;
-    @memset(&long, 'a');
-    long[CStringChunks.capacity - 1] = 0xC3;
-    long[CStringChunks.capacity] = 0xA9;
-    var chunks: CStringChunks = .init(&long);
-    const first = chunks.next().?;
-    try std.testing.expectEqual(@as(usize, CStringChunks.capacity - 1), first.len);
-    try std.testing.expectEqual(@as(u8, 0), first.ptr[first.len]);
-    const second = chunks.next().?;
-    try std.testing.expectEqual(@as(u8, 0xC3), second[0]);
-    try std.testing.expectEqual(@as(usize, 11), second.len);
-    try std.testing.expectEqual(@as(?[:0]const u8, null), chunks.next());
+test "invalid UTF-8 reads as '?', as raylib reads it" {
+    var codepoints: Codepoints = .{ .text = "a\xffé\xc3" };
+    try std.testing.expectEqual(@as(?c_int, 'a'), codepoints.next());
+    try std.testing.expectEqual(@as(?c_int, '?'), codepoints.next());
+    try std.testing.expectEqual(@as(?c_int, 'é'), codepoints.next());
+    try std.testing.expectEqual(@as(?c_int, '?'), codepoints.next());
+    try std.testing.expectEqual(@as(?c_int, null), codepoints.next());
 }
 
 test "roundness uses the largest radius against the shorter side" {
@@ -803,10 +843,17 @@ test "raylib's keys map to zui's, letters and function keys included" {
     try std.testing.expectEqual(zui.Key.unidentified, keyFor(c.KEY_KP_5));
 }
 
-test "the spacing after each glyph adds the style's letter spacing" {
+test "a glyph advances by its own advance, or by its width and the bitmap spacing, then the letter spacing" {
+    var glyphs = [_]c.GlyphInfo{
+        .{ .value = 'a', .offsetX = 1, .advanceX = 12 },
+        .{ .value = 'b', .offsetX = 1, .advanceX = 0 },
+    };
+    var recs = [_]c.Rectangle{ .{ .width = 9 }, .{ .width = 9 } };
+    const font: c.Font = .{ .baseSize = 10, .glyphCount = glyphs.len, .glyphs = &glyphs, .recs = &recs };
     const renderer: Renderer = .{};
-    try std.testing.expectEqual(@as(f32, 2), renderer.spacing(20, 0));
-    try std.testing.expectEqual(@as(f32, 5), renderer.spacing(20, 3));
+    try std.testing.expectEqual(@as(f32, 24), renderer.advance(font, 'a', 20, 0));
+    try std.testing.expectEqual(@as(f32, 27), renderer.advance(font, 'a', 20, 3));
+    try std.testing.expectEqual(@as(f32, 20 + 2), renderer.advance(font, 'b', 20, 0));
 }
 
 test "every cursor maps to one of raylib's" {

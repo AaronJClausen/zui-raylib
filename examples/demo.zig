@@ -1,157 +1,103 @@
-//! The zui reference application.
+//! The zui tour, run by `zui_app` on raylib's window.
 //!
 //! ```sh
-//! zig build demo                                        # interactive window
-//! zig build demo -- --screenshot demo.png               # render offscreen and save a PNG
-//! zig build demo -- --screenshot demo.png --about       # ...with the About dialog open
-//! zig build demo -- --screenshot grid.png --thumbnails  # ...in the thumbnail grid
-//! zig build demo -- --screenshot settings.png --settings # ...in the generated settings editor
-//! zig build demo -- --hidden                            # run interactively in a hidden window
-//! zig build demo -- --measure-idle [--thumbnails]       # report the CPU time used over 10 idle seconds
-//! zig build demo -- --measure-startup                   # report the time from process start to the first presented frame
+//! zig build demo                                     # interactive window
+//! zig build demo -- --screen box_storm               # start on one screen
+//! zig build demo -- --frames 900 --cycle 40          # visit every screen, 40 frames each, then quit
+//! zig build demo -- --screenshot tour.png --screen gallery  # render offscreen, save a PNG and quit
+//! zig build demo -- --measure-idle                   # report the CPU time used over 10 idle seconds
+//! zig build demo -- --measure-startup                # report the time from process start to the first presented frame
 //! ```
 
 const std = @import("std");
 const zui_raylib = @import("zui_raylib");
-const zui = zui_raylib.zui;
-const zui_app = zui_raylib.zui_app;
-const zui_widgets = zui_raylib.zui_widgets;
-const zui_reflect = zui_raylib.zui_reflect;
-const zui_tracy = zui_raylib.zui_tracy;
-const c = zui_raylib.c;
-const thumbnails = @import("thumbnails.zig");
+const kit = @import("kit.zig");
+const zui = kit.zui;
+const zui_app = kit.zui_app;
+const Ui = kit.Ui;
+const Tour = @import("app.zig").App;
+const FrameReason = @import("perf.zig").FrameReason;
 
-const AppSources = struct {
-    thumbnails: thumbnails.Loads = .{},
-};
+pub fn main(init: std.process.Init) !void {
+    const options = try parseOptions(try init.minimal.args.toSlice(init.arena.allocator()));
+    try zui_app.run(TourOnRaylib, init, .{ .title = "zui tour (raylib)", .size = default_window_size, .visible = !options.hidden, .resizable = !options.hidden });
+}
 
-const Ui = zui.Context(zui_app.contextConfig(zui_raylib.Renderer, .{
-    .Sources = AppSources,
-    .features = .{ .Tracer = zui_tracy.Tracer },
-}));
+const default_window_size: [2]u32 = .{ 1440, 900 };
 
-const Theme = struct {
-    background: zui.Color = .rgb(0x16161c),
-    panel: zui.Color = .rgb(0x20202a),
-    sidebar: zui.Color = .rgb(0x1a1a22),
-    text: zui.Color = .rgb(0xe8e8f0),
-    muted_text: zui.Color = .rgb(0x9a9aae),
-    accent: zui.Color = .rgb(0x5b8cff),
-    border: zui.Color = .rgb(0x34344a),
-    focus_ring: zui.Color = .rgb(0xffc65c),
-    overlay: zui.Color = .rgba(0x00000099),
-    button: std.EnumArray(zui.WidgetState, zui.Color) = .init(.{
-        .idle = .rgb(0x2c2c3c),
-        .hovered = .rgb(0x3a3a50),
-        .pressed = .rgb(0x4a6ad0),
-        .focused = .rgb(0x2c2c3c),
-        .disabled = .rgb(0x24242e),
-    }),
-};
+/// Frames drawn before a screenshot, in live mode, so it shows a settled
+/// layout and the gallery's first tiles.
+const screenshot_after_frames = 45;
 
-const theme: Theme = .{};
-
-const widgets: zui_widgets.Widgets(Ui) = .{ .theme = .{
-    .text = .{ .size = 20, .color = theme.text },
-    .muted_text_color = theme.muted_text,
-    .control = theme.button,
-    .border_color = theme.border,
-    .accent = theme.accent,
-    .track = theme.border,
-    .focus_ring = theme.focus_ring,
-    .popup_background = theme.panel,
-    .corner_radius = 6,
-    .control_height = 38,
-    .horizontal_padding = 14,
-    .checkbox_size = 22,
-    .slider_thumb_size = .{ 14, 24 },
-    .label_width = 200,
-} };
-
-/// Everything in the Settings view is generated from this struct by
-/// `zui_reflect.inspector`.
-const Preferences = struct {
-    display_name: zui_widgets.EditableText,
-    color_scheme: enum { midnight, dusk, high_contrast } = .midnight,
-    interface_scale: f32 = 1,
-    font_size: u8 = 20,
-    show_tooltips: bool = true,
-    autosave: Autosave = .{},
-    build: []const u8 = "zui-raylib 0.4.0",
-    times_saved: u32 = 0,
-
-    pub const zui_inspector: zui_reflect.Options(@This()) = .{ .fields = .{
-        .display_name = .{ .placeholder = "Your name" },
-        .interface_scale = .{ .min = 0.75, .max = 2, .step = 0.05 },
-        .font_size = .{ .min = 12, .step = 2 },
-        .times_saved = .{ .hidden = true },
-    } };
-};
-
-const Autosave = struct {
-    enabled: bool = true,
-    interval_minutes: u16 = 5,
-
-    pub const zui_inspector: zui_reflect.Options(@This()) = .{ .fields = .{
-        .interval_minutes = .{ .min = 1, .max = 60 },
-    } };
-};
-
-const thumbnail_columns = 7;
-const thumbnail_size = 120;
-const thumbnail_gap = 12;
-const thumbnail_pitch = thumbnail_size + thumbnail_gap;
-const thumbnail_rows = (thumbnails.count + thumbnail_columns - 1) / thumbnail_columns;
-
-const App = struct {
+/// The tour's application, as `zui_app` runs one: this loads its fonts
+/// into the renderer, times each step for the performance strip, and
+/// passes each step on.
+const TourOnRaylib = struct {
     pub const Host = zui_raylib.Host;
-    pub const Renderer = zui_raylib.Renderer;
+    pub const Renderer = kit.Renderer;
 
-    options: Options,
+    tour: Tour,
+    sources: *kit.Sources,
     host: *Host,
-    view: enum { documents, thumbnails, settings } = .documents,
-    clicks: u32 = 0,
-    last_action: []const u8 = "nothing yet",
-    selected_item: ?usize = 2,
-    about_open: bool = false,
-    display_name_bytes: [48]u8 = undefined,
-    preferences: Preferences = undefined,
-    preference_edits: u32 = 0,
-    sources: AppSources = .{},
-    loader: thumbnails.Loader,
+    renderer: *Renderer,
+    fonts: kit.Fonts,
+    options: Options,
     frames: u64 = 0,
-    /// Producers' wakes of the window's event wait.
-    wakes: std.atomic.Value(u32) = .init(0),
+    next: zui.NextFrame = .immediately,
+    previous_params: ?zui.FrameParams = null,
+    reason: FrameReason = .first,
+    polled_at: zui.Instant = .zero,
+    declare_started_at: zui.Instant = .zero,
+    declared_at: zui.Instant = .zero,
+    measure_calls_seen: u64 = 0,
     idle_measurement: ?IdleMeasurement = null,
 
-    pub fn init(app: *App, start: zui_app.Start(App)) !void {
+    pub fn init(app: *TourOnRaylib, start: zui_app.Start(TourOnRaylib)) !void {
         const process = start.process orelse return error.NoProcessArguments;
         const options = try parseOptions(try process.minimal.args.toSlice(process.arena.allocator()));
         app.* = .{
-            .options = options,
+            .tour = undefined,
+            .sources = &app.tour.sources,
             .host = start.host,
-            .loader = .{ .io = start.io },
-            .about_open = options.about_open,
-            .view = if (options.thumbnails) .thumbnails else if (options.settings) .settings else .documents,
+            .renderer = start.renderer,
+            .fonts = try .load(),
+            .options = options,
             .idle_measurement = if (options.measure_idle) .{ .launched_at = start.host.now() } else null,
         };
-        app.initPreferences();
-        start.host.clear_color = theme.background;
-        if (options.screenshot_path != null) start.host.drawOffscreen();
-    }
-
-    /// Cancels the loads still running, so the sources outlive them.
-    pub fn deinit(app: *App) void {
-        app.loader.deinit();
-    }
-
-    pub fn zuiDeclare(app: *App, ui: *Ui) void {
-        declare(ui, app);
-        if (app.options.screenshot_path != null or app.options.measure_startup) ui.requestFrame();
-        if (app.options.measure_startup and app.frames == 1) {
-            reportStartup(app.host);
-            app.host.close();
+        start.renderer.raylib.fonts = &app.fonts.loaded;
+        start.renderer.io = start.io;
+        app.tour.init(start.io, start.host.now());
+        app.tour.host_waker = start.waker;
+        if (options.screen) |screen| app.tour.current = screen;
+        app.tour.cycle_every = options.cycle_every;
+        if (options.measure_idle) app.tour.heartbeat = false;
+        if (options.screenshot_path != null) {
+            app.tour.live = true;
+            start.host.drawOffscreen();
         }
+    }
+
+    /// Stops the tour's producers, so the sources outlive them.
+    pub fn deinit(app: *TourOnRaylib) void {
+        app.tour.deinit();
+        app.fonts.deinit();
+        if (app.options.frame_limit != null) std.debug.print("drew {d} frames, diagnostics ok: {}\n", .{ app.frames, app.tour.perf.diagnostics.ok() });
+    }
+
+    pub fn zuiRecord(app: *TourOnRaylib, record: *zui.RecordBuilder) void {
+        // The host measured the viewport at the zoom of the record before,
+        // and the tour may have zoomed since.
+        const polled_zoom = record.params.zoom;
+        record.params.zoom = app.tour.zoom;
+        record.params.viewport = .{ record.params.viewport[0] * polled_zoom / app.tour.zoom, record.params.viewport[1] * polled_zoom / app.tour.zoom };
+        for (app.tour.environment_changes.drain()) |change| record.append(.{ .environment = change });
+        app.tour.perf.dropped_input_events +|= record.dropped_events;
+        app.reason = app.frameReason(record);
+        app.previous_params = record.params;
+        app.polled_at = app.host.now();
+    }
+
+    pub fn zuiDeclare(app: *TourOnRaylib, ui: *Ui) void {
         if (app.idle_measurement) |*measurement| {
             if (measurement.reportAt(ui.now(), app)) |report| {
                 std.debug.print("{f}\n", .{report});
@@ -160,331 +106,100 @@ const App = struct {
                 ui.requestFrameAt(measurement.nextCheckpoint());
             }
         }
-    }
-
-    /// After each frame: starts the loads it asked for, and takes the
-    /// screenshot once the frame shows what it should.
-    pub fn zuiLoader(app: *App, ui: *const Ui, _: std.Io) void {
-        app.loader.startWanted(&app.sources.thumbnails, app.waker());
-        zui_tracy.frameMark();
-        if (app.options.screenshot_path) |path| app.capture(ui, path);
-        app.frames += 1;
-    }
-
-    fn initPreferences(app: *App) void {
-        app.preferences = .{ .display_name = .init(&app.display_name_bytes, "Ada") };
-    }
-
-    fn waker(app: *App) zui.Waker {
-        return .{ .context = app, .wakeFn = countWake };
-    }
-
-    fn countWake(context: *anyopaque) void {
-        const app: *App = @ptrCast(@alignCast(context));
-        _ = app.wakes.fetchAdd(1, .monotonic);
-        app.host.zuiWaker().wake();
-    }
-
-    fn capture(app: *App, ui: *const Ui, path: [:0]const u8) void {
-        if (!screenshotReady(app)) {
-            app.host.script(screenshotSample(ui, app.view, app.frames + 1)) catch {};
-            return;
+        if (app.options.measure_startup) {
+            if (app.frames == 1) {
+                reportStartup(app.host);
+                app.host.close();
+            }
+            ui.requestFrame();
         }
-        app.host.saveScreenshot(path) catch |err| {
-            std.debug.print("could not save {s}: {t}\n", .{ path, err });
-            std.process.exit(1);
+        app.declare_started_at = app.host.now();
+        app.tour.declare(ui);
+        app.declared_at = app.host.now();
+        app.host.clear_color = kit.Palette.forEnvironment(ui.environment()).background;
+    }
+
+    /// After each frame: records what it cost, runs the tour's loaders,
+    /// and takes the screenshot once the tour has settled.
+    pub fn zuiLoader(app: *TourOnRaylib, ui: *const Ui, _: std.Io) void {
+        app.recordPerf(ui);
+        app.tour.afterFrame(ui);
+        kit.zui_tracy.frameMark();
+
+        app.frames += 1;
+        if (app.options.screenshot_path) |path| if (app.frames == screenshot_after_frames) {
+            app.host.saveScreenshot(path) catch |err| {
+                std.debug.print("could not save {s}: {t}\n", .{ path, err });
+                std.process.exit(1);
+            };
+            std.debug.print("saved {s}\n", .{path});
+            app.host.close();
         };
-        std.debug.print("saved {s}\n", .{path});
-        if (app.view == .thumbnails) std.debug.print("thumbnail loads: started {d}, completed {d}, canceled {d}; {d} wakes over {d} frames\n", .{
-            app.loader.started,
-            app.loader.completed.load(.monotonic),
-            app.loader.canceled.load(.monotonic),
-            app.wakes.load(.monotonic),
-            app.frames + 1,
+        if (app.options.frame_limit) |limit| if (app.frames == limit) app.host.close();
+
+        app.next = ui.nextFrame(app.sources);
+        const perf = &app.tour.perf;
+        perf.next_frame = app.next;
+        perf.next_frame_seconds = switch (app.next) {
+            .at => |deadline| deadline.secondsSince(ui.now()),
+            else => 0,
+        };
+    }
+
+    /// What ended the host's wait for this frame.
+    fn frameReason(app: *const TourOnRaylib, record: *const zui.RecordBuilder) FrameReason {
+        const previous = app.previous_params orelse return .first;
+        if (record.events().len != 0) return .input;
+        const params = record.params;
+        if (!std.meta.eql(params.viewport, previous.viewport) or params.scale != previous.scale or params.zoom != previous.zoom) return .resize;
+        if (sourcesPending(app.sources)) return .source;
+        return switch (app.next) {
+            .immediately => .requested,
+            .at => .timer,
+            // GLFW ended the wait for input that made no event of zui's.
+            .on_event => .input,
+        };
+    }
+
+    fn recordPerf(app: *TourOnRaylib, ui: *const Ui) void {
+        const submitted = app.renderer.last_submit;
+        const perf = &app.tour.perf;
+        const measure_calls = ui.measureCalls() - app.measure_calls_seen;
+        app.measure_calls_seen = ui.measureCalls();
+        perf.record(.{
+            .begin_frame_us = microsecondsBetween(app.polled_at, app.declare_started_at),
+            .declare_us = microsecondsBetween(app.declare_started_at, app.declared_at),
+            .end_frame_us = microsecondsBetween(app.declared_at, submitted.started_at),
+            .elements = submitted.elements,
+            .commands = submitted.commands,
+            .measure_calls = @intCast(measure_calls),
+            .reason = app.reason,
         });
-        app.host.close();
+        perf.zui_frames += 1;
+        perf.countFrameAt(ui.now().secondsSince(app.tour.started_at));
+        perf.measure_calls_total += measure_calls;
+        perf.submit_us = microsecondsBetween(submitted.started_at, submitted.ended_at);
+        perf.diagnostics = submitted.diagnostics;
+        perf.wakes = app.tour.wakes.load(.monotonic);
     }
 };
 
-const DetailsState = struct { open: bool };
-
-const ids = zui.ids(.{ "toolbar", "new", "open", "save", "documents_view", "thumbnails_view", "settings_view", "about", "sidebar", "content", "details_toggle", "hover_me", "dialog_close", "grid", "preferences", "save_preferences", "reset_preferences" });
-
-fn label(ui: *Ui, content: []const u8, size: f32, color: zui.Color) void {
-    ui.text(content, .{ .size = size, .color = color });
-}
-
-fn button(ui: *Ui, id: zui.Id, text: []const u8) bool {
-    return widgets.button(ui, id, text, .{});
-}
-
-fn toolbar(ui: *Ui, app: *App) void {
-    ui.open(.{
-        .id = ids.toolbar,
-        .layout = .{ .sizing = .{ .width = .grow, .height = .fixed(56) }, .padding = .symmetric(12, 8), .child_gap = 8, .child_alignment = .{ .y = .center } },
-        .decoration = .{ .background = theme.panel, .border = .{ .color = theme.border, .widths = .{ .bottom = 1 } } },
-    });
-    defer ui.close();
-
-    const actions = .{ .{ ids.new, "New" }, .{ ids.open, "Open" }, .{ ids.save, "Save" } };
-    inline for (actions) |action| {
-        if (button(ui, action[0], action[1])) {
-            app.clicks += 1;
-            app.last_action = action[1];
-        }
+fn sourcesPending(sources: *const kit.Sources) bool {
+    inline for (@typeInfo(kit.Sources).@"struct".fields) |field| {
+        if (@field(sources, field.name).zuiPending()) return true;
     }
-    ui.box(.{ .layout = .{ .sizing = .{ .width = .grow } } });
-    if (button(ui, ids.documents_view, "Documents")) app.view = .documents;
-    if (button(ui, ids.thumbnails_view, "Thumbnails")) app.view = .thumbnails;
-    if (button(ui, ids.settings_view, "Settings")) app.view = .settings;
-    if (button(ui, ids.about, "About")) app.about_open = true;
+    return false;
 }
 
-fn sidebar(ui: *Ui, app: *App) void {
-    ui.open(.{
-        .id = ids.sidebar,
-        .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .fixed(260), .height = .grow }, .padding = .all(8), .child_gap = 4 },
-        .decoration = .{ .background = theme.sidebar },
-        .scroll = .{},
-    });
-    defer ui.close();
-
-    var name_buffer: [32]u8 = undefined;
-    for (0..40) |index| {
-        const id: zui.Id = .indexed("item", index);
-        const selected = app.selected_item == index;
-        const state = ui.widgetState(id);
-        ui.open(.{
-            .id = id,
-            .focusable = true,
-            .cursor = .pointer,
-            .layout = .{ .sizing = .{ .width = .grow, .height = .fixed(36) }, .padding = .symmetric(12, 8), .child_alignment = .{ .y = .center } },
-            .decoration = .{
-                .background = if (selected) theme.accent else if (state == .hovered or state == .pressed) theme.button.get(.hovered) else null,
-                .corner_radius = .all(4),
-                .border = if (ui.focused(id)) .{ .color = theme.focus_ring, .widths = .all(1) } else null,
-            },
-        });
-        const name = std.fmt.bufPrint(&name_buffer, "Document {d}", .{index + 1}) catch "Document";
-        label(ui, name, 20, theme.text);
-        ui.close();
-        if (ui.clicked(id)) {
-            app.selected_item = index;
-            app.last_action = "selected a document";
-        }
-    }
-}
-
-fn mainPanel(ui: *Ui, app: *App) void {
-    ui.open(.{
-        .id = ids.content,
-        .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both, .padding = .all(28), .child_gap = 18 },
-    });
-    defer ui.close();
-
-    ui.text("zui + raylib", .{ .size = 40, .letter_spacing = 2, .color = theme.text });
-    label(ui, "This window is laid out by zui and drawn by raylib. Every element is declared each frame as nested function calls; zui computes the layout and returns render commands, and the backend draws them. Resize the window to watch this paragraph re-wrap, scroll the list on the left with the wheel, and press Tab to move focus.", 20, theme.muted_text);
-
-    ui.open(.{ .layout = .{ .child_gap = 12, .child_alignment = .{ .y = .center } } });
-    const details = ui.state(ids.details_toggle, DetailsState);
-    if (button(ui, ids.details_toggle, if (details.open) "Hide details" else "Show details")) details.open = !details.open;
-    {
-        ui.open(.{
-            .id = ids.hover_me,
-            .interactive = true,
-            .cursor = .help,
-            .layout = .{ .padding = .symmetric(14, 8) },
-            .decoration = .{ .background = theme.button.get(ui.widgetState(ids.hover_me)), .corner_radius = .all(6) },
-        });
-        defer ui.close();
-        label(ui, "Hover me", 20, theme.text);
-        if (ui.hovered(ids.hover_me) and app.preferences.show_tooltips) {
-            ui.open(.{
-                .floating = .{ .anchor = .top_center, .attach_point = .bottom_center, .offset = .{ 0, 8 } },
-                .layout = .{ .padding = .symmetric(10, 6) },
-                .decoration = .{ .background = theme.focus_ring, .corner_radius = .all(4) },
-            });
-            label(ui, "A floating tooltip", 20, theme.background);
-            ui.close();
-        }
-    }
-    ui.close();
-
-    if (details.open) {
-        ui.open(.{
-            .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .grow }, .padding = .all(16), .child_gap = 6 },
-            .decoration = .{ .background = theme.panel, .corner_radius = .all(8), .border = .{ .color = theme.border, .widths = .all(1) } },
-        });
-        label(ui, "Details", 20, theme.text);
-        label(ui, "This panel's open state lives in zui's state table under the toggle's id.", 20, theme.muted_text);
-        ui.close();
-    }
-
-    var status_buffer: [128]u8 = undefined;
-    const selected_name = if (app.selected_item) |index| index + 1 else 0;
-    const status = std.fmt.bufPrint(&status_buffer, "Clicks: {d}   Last action: {s}   Selected: document {d}", .{ app.clicks, app.last_action, selected_name }) catch "";
-    label(ui, status, 20, theme.muted_text);
-}
-
-/// Only the rows near the visible part of the grid are declared, so only
-/// their thumbnails are asked for. Keys that scroll away go unread, and
-/// once unread long enough their loads are abandoned.
-fn thumbnailGrid(ui: *Ui, app: *App) void {
-    ui.open(.{ .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both, .padding = .all(16), .child_gap = 12 } });
-    defer ui.close();
-
-    const offset = ui.scrollOffset(ids.grid)[1];
-    const visible_height = if (ui.rectOf(ids.grid)) |rect| rect.height else 600;
-    const first_row: usize = @intFromFloat(@max(0, @floor(offset / thumbnail_pitch) - 1));
-    const last_row: usize = @min(thumbnail_rows - 1, @as(usize, @intFromFloat(@floor((offset + visible_height) / thumbnail_pitch))) + 1);
-
-    var stats_buffer: [192]u8 = undefined;
-    const loader = &app.loader;
-    const summary = std.fmt.bufPrint(&stats_buffer, "{d} thumbnails, rows {d}-{d} declared.  Loads started {d}, completed {d}, canceled {d}.  Wakes {d}, frames {d}", .{
-        thumbnails.count,
-        first_row + 1,
-        last_row + 1,
-        loader.started,
-        loader.completed.load(.monotonic),
-        loader.canceled.load(.monotonic),
-        app.wakes.load(.monotonic),
-        app.frames,
-    }) catch "";
-    label(ui, summary, 20, theme.muted_text);
-
-    ui.open(.{ .id = ids.grid, .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both, .child_gap = thumbnail_gap }, .scroll = .{} });
-    defer ui.close();
-
-    const loads = ui.source(.thumbnails);
-    if (first_row > 0) ui.box(.{ .layout = .{ .sizing = .{ .height = .fixed(@as(f32, @floatFromInt(first_row)) * thumbnail_pitch - thumbnail_gap) } } });
-    for (first_row..last_row + 1) |row| {
-        ui.open(.{ .layout = .{ .child_gap = thumbnail_gap } });
-        defer ui.close();
-        for (0..thumbnail_columns) |column| {
-            const index = row * thumbnail_columns + column;
-            if (index >= thumbnails.count) break;
-            thumbnailCell(ui, index, loads.get(@intCast(index)));
-        }
-    }
-    const rows_below = thumbnail_rows - 1 - last_row;
-    if (rows_below > 0) ui.box(.{ .layout = .{ .sizing = .{ .height = .fixed(@as(f32, @floatFromInt(rows_below)) * thumbnail_pitch - thumbnail_gap) } } });
-}
-
-fn thumbnailCell(ui: *Ui, index: usize, status: thumbnails.Loads.Status) void {
-    ui.open(.{
-        .id = .indexed("thumbnail", index),
-        .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .fixed(thumbnail_size), .height = .fixed(thumbnail_size) }, .padding = .all(8), .child_alignment = .{ .x = .center, .y = .center } },
-        .decoration = .{ .background = theme.panel, .corner_radius = .all(6) },
-    });
-    defer ui.close();
-
-    switch (status) {
-        .idle, .running => label(ui, "loading", 20, theme.muted_text),
-        .canceled => label(ui, "canceled", 20, theme.muted_text),
-        .failed => label(ui, "failed", 20, theme.muted_text),
-        .ready => |thumbnail| for (thumbnail.colors) |row| {
-            ui.open(.{ .layout = .{ .sizing = .{ .width = .grow, .height = .grow } } });
-            defer ui.close();
-            for (row) |color| ui.box(.{ .layout = .{ .sizing = .grow_both }, .decoration = .{ .background = color } });
-        },
-    }
-}
-
-fn settingsView(ui: *Ui, app: *App) void {
-    ui.open(.{ .layout = .{ .sizing = .grow_both, .padding = .all(24), .child_gap = 24 } });
-    defer ui.close();
-
-    ui.open(.{
-        .id = .of("preferences_scroll"),
-        .scroll = .{},
-        .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .fixed(620), .height = .grow }, .padding = .all(16), .child_gap = 12 },
-        .decoration = .{ .background = theme.panel, .corner_radius = .all(8), .border = .{ .color = theme.border, .widths = .all(1) } },
-    });
-    label(ui, "Preferences", 30, theme.text);
-    label(ui, "Generated by zui_reflect.inspector from the Preferences struct.", 20, theme.muted_text);
-    if (zui_reflect.inspector(widgets, ui, ids.preferences, &app.preferences)) app.preference_edits += 1;
-    ui.open(.{ .layout = .{ .child_gap = 8 } });
-    if (widgets.button(ui, ids.save_preferences, "Save", .{})) app.preferences.times_saved += 1;
-    if (widgets.button(ui, ids.reset_preferences, "Reset", .{})) {
-        const times_saved = app.preferences.times_saved;
-        app.initPreferences();
-        app.preferences.times_saved = times_saved;
-    }
-    ui.close();
-    ui.close();
-
-    const preferences = &app.preferences;
-    const card_color: zui.Color = switch (preferences.color_scheme) {
-        .midnight => .rgb(0x20202a),
-        .dusk => .rgb(0x3a2a3e),
-        .high_contrast => .black,
-    };
-    ui.open(.{
-        .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .grow }, .padding = .all(20), .child_gap = 10 },
-        .decoration = .{
-            .background = card_color,
-            .corner_radius = .all(8),
-            .border = .{ .color = if (preferences.color_scheme == .high_contrast) .white else theme.border, .widths = .all(1) },
-        },
-    });
-    defer ui.close();
-    var buffer: [160]u8 = undefined;
-    const greeting = std.fmt.bufPrint(&buffer, "Hello, {s}!", .{if (preferences.display_name.len == 0) "stranger" else preferences.display_name.slice()}) catch "Hello!";
-    label(ui, greeting, @as(f32, @floatFromInt(preferences.font_size)) * preferences.interface_scale, theme.text);
-    const autosave = if (preferences.autosave.enabled)
-        std.fmt.bufPrint(buffer[80..], "Autosaving every {d} min", .{preferences.autosave.interval_minutes}) catch ""
-    else
-        "Autosave is off";
-    label(ui, autosave, 20, theme.muted_text);
-    var counts_buffer: [80]u8 = undefined;
-    const counts = std.fmt.bufPrint(&counts_buffer, "Edits: {d}   Saves: {d}", .{ app.preference_edits, preferences.times_saved }) catch "";
-    label(ui, counts, 20, theme.muted_text);
-}
-
-fn aboutDialog(ui: *Ui, app: *App) void {
-    if (!app.about_open) return;
-    if (ui.keyPressed(.escape)) app.about_open = false;
-
-    ui.open(.{
-        .interactive = true,
-        .floating = .{ .attach_to = .root, .z = 10 },
-        .layout = .{ .sizing = .grow_both, .child_alignment = .{ .x = .center, .y = .center } },
-        .decoration = .{ .background = theme.overlay },
-    });
-    defer ui.close();
-    ui.open(.{
-        .focus_scope = true,
-        .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .fixed(420) }, .padding = .all(24), .child_gap = 14 },
-        .decoration = .{ .background = theme.panel, .corner_radius = .all(10), .border = .{ .color = theme.border, .widths = .all(1) } },
-    });
-    defer ui.close();
-    label(ui, "About", 30, theme.text);
-    label(ui, "zui is an immediate-mode UI layout library for Zig. This dialog floats in its own layer and keeps tab focus inside it. Press Escape or Close.", 20, theme.muted_text);
-    if (button(ui, ids.dialog_close, "Close")) app.about_open = false;
-}
-
-fn declare(ui: *Ui, app: *App) void {
-    ui.open(.{ .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both }, .decoration = .{ .background = theme.background } });
-    defer ui.close();
-    toolbar(ui, app);
-    switch (app.view) {
-        .documents => {
-            ui.open(.{ .layout = .{ .sizing = .grow_both } });
-            sidebar(ui, app);
-            mainPanel(ui, app);
-            ui.close();
-        },
-        .thumbnails => thumbnailGrid(ui, app),
-        .settings => settingsView(ui, app),
-    }
-    aboutDialog(ui, app);
+fn microsecondsBetween(earlier: zui.Instant, later: zui.Instant) f32 {
+    return later.secondsSince(earlier) * std.time.us_per_s;
 }
 
 const Options = struct {
+    screen: ?kit.Screen = null,
+    frame_limit: ?u64 = null,
+    cycle_every: ?u32 = null,
     screenshot_path: ?[:0]const u8 = null,
-    about_open: bool = false,
-    thumbnails: bool = false,
-    settings: bool = false,
     hidden: bool = false,
     measure_idle: bool = false,
     measure_startup: bool = false,
@@ -495,17 +210,20 @@ fn parseOptions(arguments: []const [:0]const u8) !Options {
     var index: usize = 1;
     while (index < arguments.len) : (index += 1) {
         const argument = arguments[index];
-        if (std.mem.eql(u8, argument, "--screenshot")) {
+        const has_value = index + 1 < arguments.len;
+        if (std.mem.eql(u8, argument, "--screen") and has_value) {
             index += 1;
-            if (index == arguments.len) return error.MissingScreenshotPath;
+            options.screen = try parseScreen(arguments[index]);
+        } else if (std.mem.eql(u8, argument, "--frames") and has_value) {
+            index += 1;
+            options.frame_limit = try std.fmt.parseInt(u64, arguments[index], 10);
+        } else if (std.mem.eql(u8, argument, "--cycle") and has_value) {
+            index += 1;
+            options.cycle_every = try std.fmt.parseInt(u32, arguments[index], 10);
+        } else if (std.mem.eql(u8, argument, "--screenshot") and has_value) {
+            index += 1;
             options.screenshot_path = arguments[index];
             options.hidden = true;
-        } else if (std.mem.eql(u8, argument, "--about")) {
-            options.about_open = true;
-        } else if (std.mem.eql(u8, argument, "--thumbnails")) {
-            options.thumbnails = true;
-        } else if (std.mem.eql(u8, argument, "--settings")) {
-            options.settings = true;
         } else if (std.mem.eql(u8, argument, "--hidden")) {
             options.hidden = true;
         } else if (std.mem.eql(u8, argument, "--measure-idle")) {
@@ -515,19 +233,23 @@ fn parseOptions(arguments: []const [:0]const u8) !Options {
             options.hidden = true;
             options.measure_startup = true;
         } else {
-            std.debug.print("unknown argument \"{s}\"; expected --screenshot <path>, --about, --thumbnails, --settings, --hidden, --measure-idle or --measure-startup\n", .{argument});
+            std.debug.print("unknown argument \"{s}\"; expected --screen <name>, --frames <count>, --cycle <frames>, --screenshot <path>, --hidden, --measure-idle or --measure-startup\n", .{argument});
             return error.UnknownArgument;
         }
     }
     return options;
 }
 
-pub fn main(init: std.process.Init) !void {
-    const options = try parseOptions(try init.minimal.args.toSlice(init.arena.allocator()));
-    try zui_app.run(App, init, .{ .title = "zui + raylib", .size = .{ 1100, 700 }, .visible = !options.hidden, .resizable = !options.hidden });
+fn parseScreen(name: []const u8) !kit.Screen {
+    return std.meta.stringToEnum(kit.Screen, name) orelse {
+        std.debug.print("unknown screen \"{s}\"; expected one of:", .{name});
+        for (std.meta.fieldNames(kit.Screen)) |screen_name| std.debug.print(" {s}", .{screen_name});
+        std.debug.print("\n", .{});
+        return error.UnknownScreen;
+    };
 }
 
-/// `--measure-idle`: the CPU time the demo uses while idle, read by the
+/// `--measure-idle`: the CPU time the tour uses while idle, read by the
 /// process itself at two frames it asks for with `requestFrameAt`, so the
 /// run ends on its own and needs no outside sampler.
 const IdleMeasurement = struct {
@@ -563,9 +285,9 @@ const IdleMeasurement = struct {
 
     /// Called in every frame; the frame at the end of the measurement
     /// counts toward it.
-    fn reportAt(self: *IdleMeasurement, at: zui.Instant, app: *const App) ?Report {
+    fn reportAt(self: *IdleMeasurement, at: zui.Instant, app: *const TourOnRaylib) ?Report {
         if (at.isBefore(self.nextCheckpoint())) return null;
-        const checkpoint: Checkpoint = .{ .at = at, .cpu_nanoseconds = processCpuNanoseconds(), .frames = app.frames, .wakes = app.wakes.load(.monotonic) };
+        const checkpoint: Checkpoint = .{ .at = at, .cpu_nanoseconds = processCpuNanoseconds(), .frames = app.frames, .wakes = app.tour.wakes.load(.monotonic) };
         const start = self.start orelse {
             self.start = checkpoint;
             return null;
@@ -604,7 +326,7 @@ fn processCpuNanoseconds() u64 {
 
 /// `--measure-startup`: from the moment the OS created the process to the
 /// moment the first frame was presented, read in the second frame.
-fn reportStartup(host: *const App.Host) void {
+fn reportStartup(host: *const TourOnRaylib.Host) void {
     const presented = host.first_present orelse return std.debug.print("startup: no frame was presented\n", .{});
     if (@import("builtin").os.tag != .windows) return std.debug.print("startup: not measured on this system\n", .{});
     var wall_now: windows.FILETIME = undefined;
@@ -627,45 +349,4 @@ fn fileTimeTicks(time: windows.FILETIME) u64 {
 
 fn timevalNanoseconds(time: anytype) u64 {
     return @as(u64, @intCast(time.sec)) * std.time.ns_per_s + @as(u64, @intCast(time.usec)) * std.time.ns_per_us;
-}
-
-fn centerOf(rect: zui.Rect) [2]f32 {
-    return .{ rect.x + rect.width / 2, rect.y + rect.height / 2 };
-}
-
-/// The input frame `frame` of a screenshot is taken with, known from the
-/// layout of the frame before it.
-fn screenshotSample(ui: *const Ui, view: @FieldType(App, "view"), frame: u64) zui.InputSampler.Sample {
-    var sample: zui.InputSampler.Sample = .{};
-    switch (view) {
-        // Rest the pointer on "Hover me" so the screenshot shows hover
-        // state and the tooltip.
-        .documents => sample.pointer = if (ui.rectOf(ids.hover_me)) |rect| centerOf(rect) else null,
-        // Scroll far down once loads are underway, so the rows that leave
-        // the screen go unread and their loads are abandoned.
-        .thumbnails => {
-            sample.pointer = if (ui.rectOf(ids.grid)) |rect| centerOf(rect) else null;
-            if (frame == 5) sample.wheel = .{ 0, 3000 };
-        },
-        // Click the color scheme dropdown open, then rest the pointer on its
-        // last option so it shows hover state.
-        .settings => {
-            const dropdown = ids.preferences.child("color_scheme");
-            const target = if (frame < 3) dropdown else dropdown.indexedChild("option", 2);
-            sample.pointer = if (ui.rectOf(target)) |rect| centerOf(rect) else null;
-            if (frame == 1) sample.buttons = .initOne(.primary);
-        },
-    }
-    return sample;
-}
-
-/// Documents: three frames (lay out, hover, show the tooltip). Thumbnails:
-/// once some loads have finished and some scrolled-away ones were
-/// abandoned. Settings: once the dropdown is open with an option hovered.
-fn screenshotReady(app: *const App) bool {
-    return switch (app.view) {
-        .documents => app.frames == 2,
-        .thumbnails => (app.loader.completed.load(.monotonic) >= 20 and app.loader.canceled.load(.monotonic) >= 1) or app.frames > 600,
-        .settings => app.frames == 5,
-    };
 }
