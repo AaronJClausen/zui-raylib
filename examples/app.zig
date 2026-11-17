@@ -64,6 +64,8 @@ pub const App = struct {
     live: bool = false,
     inspector_open: bool = false,
     inspector_position: [2]f32 = .{ 760, 90 },
+    zui_debug_open: bool = false,
+    zui_debug_inspector: kit.Inspector = .{},
     /// Advances to the next screen every this many zui frames, for smoke tests.
     cycle_every: ?u32 = null,
     frames_on_screen: u32 = 0,
@@ -128,6 +130,7 @@ pub const App = struct {
         app.strip(ui, &frame_shell);
         ui.close();
         if (app.inspector_open) app.inspector(ui, &frame_shell);
+        if (app.zui_debug_open) app.zui_debug_inspector.declare(ui);
 
         if (app.live) ui.requestFrame();
         if (app.heartbeat) {
@@ -141,6 +144,12 @@ pub const App = struct {
             app.frames_on_screen = 0;
             ui.requestFrame();
         }
+    }
+
+    /// Copies what `zui_debug`'s panel shows out of `frame`, while it is open.
+    pub fn observe(app: *App, ui: *const Ui, frame: *const Ui.Frame) void {
+        if (!app.zui_debug_open) return;
+        app.zui_debug_inspector.observe(frame, if (ui.primaryPointer()) |pointer| pointer.position else null);
     }
 
     /// The loaders: start what this frame asked for, stop what it stopped reading.
@@ -180,6 +189,11 @@ pub const App = struct {
         if (ui.chordPressed(.{ .key = .minus, .modifiers = control })) app.setZoom(app.zoom - 0.1);
         if (ui.chordPressed(.{ .key = .i, .modifiers = control })) app.inspector_open = !app.inspector_open;
         if (ui.chordPressed(.{ .key = .l, .modifiers = control })) app.live = !app.live;
+        if (ui.chordPressed(.{ .key = .f12 })) {
+            app.zui_debug_open = !app.zui_debug_open;
+            // The panel stays empty until a frame it observed is followed by another.
+            ui.requestFrame();
+        }
     }
 
     fn setZoom(app: *App, zoom: f32) void {
@@ -265,6 +279,7 @@ pub const App = struct {
         frame_shell.label(ui, .tiny, "Ctrl+= / Ctrl+-  zoom");
         frame_shell.label(ui, .tiny, "Ctrl+I  frame inspector");
         frame_shell.label(ui, .tiny, "Ctrl+L  live mode");
+        frame_shell.label(ui, .tiny, "F12  zui_debug inspector");
         frame_shell.label(ui, .tiny, "Tab  move focus");
     }
 

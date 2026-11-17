@@ -10,6 +10,7 @@ pub const zui_widgets = @import("zui_widgets");
 pub const zui_reflect = @import("zui_reflect");
 pub const zui_async = @import("zui_async");
 pub const zui_tracy = @import("zui_tracy");
+pub const zui_debug = @import("zui_debug");
 
 /// The raw raylib bindings, translated from raylib.h.
 pub const c = @import("raylib");

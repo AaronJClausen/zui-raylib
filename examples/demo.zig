@@ -7,6 +7,7 @@
 //! zig build demo -- --screenshot tour.png --screen gallery  # render offscreen, save a PNG and quit
 //! zig build demo -- --measure-idle                   # report the CPU time used over 10 idle seconds
 //! zig build demo -- --measure-startup                # report the time from process start to the first presented frame
+//! zig build demo -- --zui-debug                      # open zui_debug's inspector, which F12 toggles
 //! ```
 
 const std = @import("std");
@@ -20,7 +21,16 @@ const FrameReason = @import("perf.zig").FrameReason;
 
 pub fn main(init: std.process.Init) !void {
     const options = try parseOptions(try init.minimal.args.toSlice(init.arena.allocator()));
-    try zui_app.run(TourOnRaylib, init, .{ .title = "zui tour (raylib)", .size = default_window_size, .visible = !options.hidden, .resizable = !options.hidden });
+    try zui_app.run(TourOnRaylib, init, .{ .title = "zui tour (raylib)", .size = default_window_size, .visible = !options.hidden, .resizable = !options.hidden, .notify = logAndKeepRunReport });
+}
+
+/// What `zui_app` started with, for `zui_debug`'s panel to list among the
+/// fallbacks. A notice carries no application, so it waits here.
+var run_report: ?zui_app.Report = null;
+
+fn logAndKeepRunReport(notice: zui_app.Notice) void {
+    if (notice == .started) run_report = notice.started;
+    zui_app.logNotice(notice);
 }
 
 const default_window_size: [2]u32 = .{ 1440, 900 };
@@ -66,10 +76,12 @@ const TourOnRaylib = struct {
         };
         start.renderer.raylib.fonts = &app.fonts.loaded;
         start.renderer.io = start.io;
+        kit.ZoneTimer.useClock(start.io);
         app.tour.init(start.io, start.host.now());
         app.tour.host_waker = start.waker;
         if (options.screen) |screen| app.tour.current = screen;
         app.tour.cycle_every = options.cycle_every;
+        app.tour.zui_debug_open = options.zui_debug;
         if (options.measure_idle) app.tour.heartbeat = false;
         if (options.screenshot_path != null) {
             app.tour.live = true;
@@ -117,6 +129,14 @@ const TourOnRaylib = struct {
         app.tour.declare(ui);
         app.declared_at = app.host.now();
         app.host.clear_color = kit.Palette.forEnvironment(ui.environment()).background;
+    }
+
+    pub fn zuiObserve(app: *TourOnRaylib, ui: *const Ui, frame: *const Ui.Frame) void {
+        if (run_report) |report| {
+            app.tour.zui_debug_inspector.reportRun(report);
+            run_report = null;
+        }
+        app.tour.observe(ui, frame);
     }
 
     /// After each frame: records what it cost, runs the tour's loaders,
@@ -203,6 +223,7 @@ const Options = struct {
     hidden: bool = false,
     measure_idle: bool = false,
     measure_startup: bool = false,
+    zui_debug: bool = false,
 };
 
 fn parseOptions(arguments: []const [:0]const u8) !Options {
@@ -232,8 +253,10 @@ fn parseOptions(arguments: []const [:0]const u8) !Options {
         } else if (std.mem.eql(u8, argument, "--measure-startup")) {
             options.hidden = true;
             options.measure_startup = true;
+        } else if (std.mem.eql(u8, argument, "--zui-debug")) {
+            options.zui_debug = true;
         } else {
-            std.debug.print("unknown argument \"{s}\"; expected --screen <name>, --frames <count>, --cycle <frames>, --screenshot <path>, --hidden, --measure-idle or --measure-startup\n", .{argument});
+            std.debug.print("unknown argument \"{s}\"; expected --screen <name>, --frames <count>, --cycle <frames>, --screenshot <path>, --hidden, --measure-idle, --measure-startup or --zui-debug\n", .{argument});
             return error.UnknownArgument;
         }
     }

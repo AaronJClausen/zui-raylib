@@ -9,6 +9,7 @@ pub const zui_widgets = zui_raylib.zui_widgets;
 pub const zui_reflect = zui_raylib.zui_reflect;
 pub const zui_async = zui_raylib.zui_async;
 pub const zui_tracy = zui_raylib.zui_tracy;
+pub const zui_debug = zui_raylib.zui_debug;
 pub const Perf = @import("perf.zig").Perf;
 pub const Renderer = @import("perf.zig").TimedRenderer;
 const mission = @import("screens/mission_control.zig");
@@ -24,7 +25,7 @@ pub const Sources = struct {
 
 pub const Ui = zui.Context(zui_app.contextConfig(Renderer, .{
     .Sources = Sources,
-    .features = .{ .Tracer = zui_tracy.Tracer },
+    .features = .{ .Tracer = ZoneTimer },
     .limits = .{
         .max_elements = 16384,
         .max_depth = 128,
@@ -36,6 +37,9 @@ pub const Ui = zui.Context(zui_app.contextConfig(Renderer, .{
     },
 }));
 
+/// Times each zone for `zui_debug`'s panel, and passes it on to Tracy.
+pub const ZoneTimer = zui_debug.ZoneTimer(zui_tracy.Tracer);
+pub const Inspector = zui_debug.Inspector(Ui);
 pub const Widgets = zui_widgets.Widgets(Ui);
 pub const TextStyle = Ui.TextStyle;
 

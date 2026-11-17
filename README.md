@@ -28,6 +28,7 @@ zig build demo -- --frames 900 --cycle 40          # visit every screen, 40 fram
 zig build demo -- --screenshot tour.png --screen typography  # render offscreen in live mode, save a PNG, quit
 zig build demo -- --measure-idle                   # report the CPU used over 10 idle seconds
 zig build demo -- --measure-startup                # report the time from process start to the first presented frame
+zig build demo -- --zui-debug                      # open zui_debug's inspector, which F12 toggles
 zig build demo -Dzui-tracy=true                    # trace zui's zones into Tracy 0.14.1
 zig build test-tour                                # declare every screen headlessly and check it fits
 ```
@@ -40,7 +41,13 @@ resize, `requestFrame`, a `requestFrameAt` deadline, a source); what
 emission, and raylib's drawing; element and command counts; and how many
 texts missed the measurement cache. **Ctrl+I** opens a draggable frame
 inspector with the last 120 frames, the frame's limits and diagnostics,
-and the environment.
+and the environment. **F12** opens zui's own inspector, `zui_debug`,
+along the right edge: the frame's diagnostics, the fallbacks in effect
+(what this renderer lowers and the host lacks), each zone's time from
+its `ZoneTimer` tracer, the element tree, and the configs of the element
+under the pointer. `zui_app`'s `zuiObserve` hands it each frame. Its
+theme does not reload from a file here, since this host has no file
+watch.
 
 | Screen | What it shows |
 |---|---|
@@ -65,10 +72,12 @@ costs live, and Tab moves focus.
 
 `examples/demo.zig` is the tour's application as `zui_app` runs it: it
 loads the fonts into the renderer, sets the record's zoom and the
-environment changes the tour makes up, and times each step for the strip;
+environment changes the tour makes up, hands each frame to `zui_debug`
+while its panel is open, and times each step for the strip;
 `kit.Renderer` wraps `zui_raylib.Renderer` to time its submits. The tour
 itself (`app.zig`, `kit.zig`, `perf.zig` and `screens/`) is zui-sokol's,
-with raylib's fonts in place of sokol_debugtext's and stb_truetype's.
+with raylib's fonts in place of sokol_debugtext's and stb_truetype's,
+and `zui_debug`'s panel on F12, which zui-sokol's does not have yet.
 
 `--measure-idle` runs the tour in a hidden window and reads its own CPU
 time at two frames it asks for with `requestFrameAt`, 10 seconds apart,

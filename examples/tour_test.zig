@@ -31,9 +31,14 @@ const Harness = struct {
     }
 
     fn frame(harness: *Harness, viewport: [2]f32) *const Ui.Frame {
+        return harness.frameWith(viewport, &.{});
+    }
+
+    fn frameWith(harness: *Harness, viewport: [2]f32, input: []const zui.Event) *const Ui.Frame {
         harness.frame_number += 1;
         var events: [16]zui.Event = undefined;
-        var event_count: usize = 0;
+        @memcpy(events[0..input.len], input);
+        var event_count: usize = input.len;
         for (harness.app.environment_changes.drain()) |change| {
             events[event_count] = .{ .environment = change };
             event_count += 1;
@@ -42,6 +47,7 @@ const Harness = struct {
         harness.ui.beginFrame(&.{ .params = params, .events = events[0..event_count] }, &harness.app.sources);
         harness.app.declare(&harness.ui);
         const result = harness.ui.endFrame();
+        harness.app.observe(&harness.ui, result);
         harness.app.afterFrame(&harness.ui);
         return result;
     }
@@ -110,6 +116,32 @@ test "every screen fits the default window: no scrolling, no text cut off" {
         try testing.expectEqual([2]f32{ 0, 0 }, stageOverflow(frame));
         try testing.expectEqual(@as(u32, 0), textPastStage(frame));
     }
+}
+
+test "F12 opens zui_debug's panel over the classic screen, listing its elements, and closes it" {
+    var harness: Harness = .{};
+    try harness.init();
+    defer harness.deinit();
+    harness.ui.release(settledFrame(&harness, .classic, default_window));
+
+    const f12: zui.Event = .{ .key_down = .{ .key = .f12, .at = .zero } };
+    harness.ui.release(harness.frameWith(default_window, &.{f12}));
+    const opened = harness.frame(default_window);
+    defer harness.ui.release(opened);
+    try testing.expect(opened.diagnostics.ok());
+    const panel = opened.lookup(kit.Inspector.default_panel_id.hash).?;
+    const panel_elements = opened.inspect(panel).subtree_end - panel;
+    try testing.expectEqual(opened.elementCount() - panel_elements, harness.app.zui_debug_inspector.rows().len);
+    var documents: usize = 0;
+    for (harness.app.zui_debug_inspector.rows()) |row| {
+        if (row.kind == .text and std.mem.startsWith(u8, row.textPreview(), "Document ")) documents += 1;
+    }
+    try testing.expect(documents > 0);
+
+    harness.ui.release(harness.frameWith(default_window, &.{f12}));
+    const closed = harness.frame(default_window);
+    defer harness.ui.release(closed);
+    try testing.expectEqual(@as(?Ui.Index, null), closed.lookup(kit.Inspector.default_panel_id.hash));
 }
 
 test "the tour's TrueType fonts load without a window, and measure proportionally or monospaced" {
