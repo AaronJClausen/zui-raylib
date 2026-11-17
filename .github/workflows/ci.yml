@@ -58,7 +58,10 @@ jobs:
         run: xvfb-run --auto-servernum zig build conformance
       - run: zig build test-tour
       - name: Visit every screen of the tour
-        run: xvfb-run --auto-servernum zig build demo -- --hidden --frames 600 --cycle 50 2>&1 | tee cycle.log && grep "diagnostics ok: true" cycle.log
+        run: |
+          set -o pipefail
+          xvfb-run --auto-servernum zig build demo -- --hidden --frames 600 --cycle 50 2>&1 | tee cycle.log
+          grep "diagnostics ok: true" cycle.log
       - name: Render the tour offscreen
         run: |
           for screen in welcome gallery mission_control typography light_and_depth; do
